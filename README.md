@@ -469,12 +469,14 @@ ImageWAM is built on several codebases:
 If you find this repository helpful for your research, please cite our paper:
 
 ```bibtex
-@misc{zhangimagewam2026,
-  title  = {ImageWAM: Do World Action Models Really Need Video Generation, or Just Image Editing?},
-  author = {Yuyang Zhang, Wenyao Zhang, Zekun Qi, He Zhang, Haitao Lin, Jingbo Zhang, Yao Mu, Xiaokang Yang, Wenjun Zeng, Xin Jin},
-  eprint={2606.19531},
-  archivePrefix={arXiv},
-  url={https://arxiv.org/abs/2606.19531}, 
+@misc{zhang2026imagewam,
+      title={ImageWAM: Do World Action Models Really Need Video Generation, or Just Image Editing?}, 
+      author={Yuyang Zhang and Wenyao Zhang and Zekun Qi and He Zhang and Haitao Lin and Jingbo Zhang and Yao Mu and Xiaokang Yang and Wenjun Zeng and Xin Jin},
+      year={2026},
+      eprint={2606.19531},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2606.19531}, 
 }
 ```
 
