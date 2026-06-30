@@ -1,0 +1,23 @@
+defaults:
+  - robotwin_omnigen2
+  - _self_
+
+train:
+  lerobot_backend: v3
+  lerobot_v3_init_num_workers: 16
+  lerobot_tolerance_s: 0.04
+  lerobot_v3_index_cache: ./dataset_meta/robotwin_omnigen2_v3_train_lerobot_v3_index.json
+  lerobot_v3_video_backend: torchcodec
+  slow_getitem_log_sec: 0.0
+  lerobot_meta_cache: null
+  arrow_cache_dir: null
+
+val:
+  lerobot_backend: ${data.train.lerobot_backend}
+  lerobot_v3_init_num_workers: ${data.train.lerobot_v3_init_num_workers}
+  lerobot_tolerance_s: ${data.train.lerobot_tolerance_s}
+  lerobot_v3_index_cache: ./dataset_meta/robotwin_omnigen2_v3_val_lerobot_v3_index.json
+  lerobot_v3_video_backend: ${data.train.lerobot_v3_video_backend}
+  slow_getitem_log_sec: ${data.train.slow_getitem_log_sec}
+  lerobot_meta_cache: ${data.train.lerobot_meta_cache}
+  arrow_cache_dir: ${data.train.arrow_cache_dir}
