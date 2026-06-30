@@ -191,8 +191,6 @@ class MultiLeRobotDatasetV3(torch.utils.data.Dataset):
         **_: Any,
     ) -> None:
         super().__init__()
-        if nonidle_filter_path is not None:
-            raise NotImplementedError("nonidle_filter_path is not supported by the LeRobot v3 backend yet.")
 
         try:
             from lerobot.datasets.lerobot_dataset import LeRobotDataset as LeRobotDatasetV3
@@ -210,6 +208,8 @@ class MultiLeRobotDatasetV3(torch.utils.data.Dataset):
         self.hetero_bridge = HeteroLeRobotBridge(hetero_bridge, self.ds_names) if _is_bridge_enabled(hetero_bridge) else None
         self.image_transforms = image_transforms
         self.delta_timestamps = delta_timestamps
+        self.nonidle_filter_path = None if nonidle_filter_path is None else Path(nonidle_filter_path).expanduser()
+        self._nonidle_filtered_indices: list[int] | None = None
         self.during_training = True
         self._lerobot_cls = LeRobotDatasetV3
         self._datasets: list[_V3DatasetEntry] = []
@@ -294,6 +294,7 @@ class MultiLeRobotDatasetV3(torch.utils.data.Dataset):
 
         self._build_offsets_from_entries()
         self.episode_data_index = self._build_global_episode_data_index()
+        self._load_nonidle_filter()
         self.stats = {}
         self._save_index_cache(index_cache_path)
 
@@ -319,6 +320,78 @@ class MultiLeRobotDatasetV3(torch.utils.data.Dataset):
             "from": torch.LongTensor(starts),
             "to": torch.LongTensor(ends),
         }
+
+    def _entry_episode_indices(self, entry: _V3DatasetEntry) -> list[int]:
+        if entry.episodes is not None:
+            return [int(ep_idx) for ep_idx in entry.episodes]
+
+        meta = getattr(entry.dataset, "meta", None)
+        episodes = getattr(meta, "episodes", None)
+        if episodes is not None:
+            column_names = getattr(episodes, "column_names", None)
+            if column_names is None:
+                features = getattr(episodes, "features", None)
+                column_names = list(features) if features is not None else []
+            if "episode_index" in column_names:
+                return self._int_column(episodes, "episode_index")
+
+        return list(range(int(entry.num_episodes)))
+
+    def _load_nonidle_filter(self) -> None:
+        if self.nonidle_filter_path is None:
+            return
+        if not self.nonidle_filter_path.exists():
+            raise FileNotFoundError(f"Non-idle filter JSON not found: {self.nonidle_filter_path}")
+
+        payload = json.loads(self.nonidle_filter_path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict) and "episodes" in payload:
+            episode_ranges = payload["episodes"]
+        else:
+            episode_ranges = payload
+        if not isinstance(episode_ranges, dict):
+            raise ValueError(
+                f"Non-idle filter JSON must contain an episode range mapping, got {type(episode_ranges)}"
+            )
+
+        filtered_indices: list[int] = []
+        global_episode_pos = 0
+        for entry, lengths in zip(self._datasets, self._episode_lengths_by_dataset, strict=True):
+            episode_indices = self._entry_episode_indices(entry)
+            if len(episode_indices) != len(lengths):
+                raise RuntimeError(
+                    f"LeRobot v3 episode index/length mismatch for root={entry.root}: "
+                    f"{len(episode_indices)} indices vs {len(lengths)} lengths"
+                )
+
+            for local_episode_pos, episode_idx in enumerate(episode_indices):
+                ep_start = int(self.episode_data_index["from"][global_episode_pos].item())
+                ep_end = int(self.episode_data_index["to"][global_episode_pos].item())
+                ranges = episode_ranges.get(str(episode_idx), episode_ranges.get(int(episode_idx), None))
+                if ranges is None:
+                    keep_indices = range(ep_start, ep_end)
+                else:
+                    keep_list: list[int] = []
+                    episode_len = int(lengths[local_episode_pos])
+                    for raw_start, raw_end in ranges:
+                        start = max(0, int(raw_start))
+                        end = min(episode_len, int(raw_end))
+                        if end <= start:
+                            continue
+                        keep_list.extend(range(ep_start + start, ep_start + end))
+                    keep_indices = sorted(set(keep_list))
+                filtered_indices.extend(int(idx) for idx in keep_indices)
+                global_episode_pos += 1
+
+        if len(filtered_indices) == 0:
+            raise ValueError(f"Non-idle filter removed all frames: {self.nonidle_filter_path}")
+
+        self._nonidle_filtered_indices = filtered_indices
+        logger.info(
+            "Loaded LeRobot v3 non-idle filter %s: kept %d/%d frames.",
+            self.nonidle_filter_path,
+            len(filtered_indices),
+            self._frame_offsets[-1],
+        )
 
     def _entry_info(self, entry: _V3DatasetEntry) -> dict[str, Any]:
         if entry.info is not None:
@@ -482,6 +555,8 @@ class MultiLeRobotDatasetV3(torch.utils.data.Dataset):
 
     @property
     def num_frames(self) -> int:
+        if self._nonidle_filtered_indices is not None:
+            return len(self._nonidle_filtered_indices)
         return self._frame_offsets[-1]
 
     @property
@@ -492,7 +567,7 @@ class MultiLeRobotDatasetV3(torch.utils.data.Dataset):
         return self.num_frames
 
     def _resolve_frame_index(self, idx: int) -> tuple[int, int]:
-        if idx < 0 or idx >= len(self):
+        if idx < 0 or idx >= self._frame_offsets[-1]:
             raise IndexError(f"Index {idx} out of bounds.")
         dataset_idx = bisect_right(self._frame_offsets, idx) - 1
         local_idx = idx - self._frame_offsets[dataset_idx]
@@ -507,7 +582,8 @@ class MultiLeRobotDatasetV3(torch.utils.data.Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         profile_on = _PROFILE_CTX.get() is not None
-        dataset_idx, local_idx = self._resolve_frame_index(idx)
+        raw_idx = int(self._nonidle_filtered_indices[idx]) if self._nonidle_filtered_indices is not None else idx
+        dataset_idx, local_idx = self._resolve_frame_index(raw_idx)
         t0 = time.perf_counter() if profile_on else 0.0
         item = dict(self._datasets[dataset_idx].dataset[local_idx])
         if profile_on:
