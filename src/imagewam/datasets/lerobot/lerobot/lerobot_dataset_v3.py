@@ -14,6 +14,7 @@ import torch
 from tqdm import tqdm
 
 from .datasets.video_utils import _PROFILE_CTX, _profile_add
+from .datasets.utils import get_delta_indices
 from .lerobot_dataset import HeteroLeRobotBridge, _is_bridge_enabled
 
 logger = logging.getLogger(__name__)
@@ -145,6 +146,7 @@ class _V3DatasetEntry:
         num_frames: int | None = None,
         episode_lengths: list[int] | None = None,
         info: dict[str, Any] | None = None,
+        delta_indices: dict[str, list[int]] | None = None,
     ) -> None:
         self.dataset = dataset
         self.root = root
@@ -153,6 +155,7 @@ class _V3DatasetEntry:
         self._num_frames = int(num_frames) if num_frames is not None else None
         self.episode_lengths = episode_lengths
         self.info = info
+        self.delta_indices = delta_indices
 
     @property
     def num_frames(self) -> int:
@@ -209,7 +212,10 @@ class MultiLeRobotDatasetV3(torch.utils.data.Dataset):
         self.image_transforms = image_transforms
         self.delta_timestamps = delta_timestamps
         self.nonidle_filter_path = None if nonidle_filter_path is None else Path(nonidle_filter_path).expanduser()
+        self._strict_nonidle = self.nonidle_filter_path is not None
         self._nonidle_filtered_indices: list[int] | None = None
+        self._nonidle_keep_indices_by_episode_pos: list[list[int]] | None = None
+        self._nonidle_raw_index_to_keep_rank: dict[int, int] | None = None
         self.during_training = True
         self._lerobot_cls = LeRobotDatasetV3
         self._datasets: list[_V3DatasetEntry] = []
@@ -226,26 +232,33 @@ class MultiLeRobotDatasetV3(torch.utils.data.Dataset):
                 if self.hetero_bridge is not None
                 else delta_timestamps
             )
-            return LeRobotDatasetV3(
+            dataset = LeRobotDatasetV3(
                 repo_id=ds_name,
                 root=ds_root,
                 episodes=selected_episodes,
-                image_transforms=image_transforms,
-                delta_timestamps=child_delta_timestamps,
+                image_transforms=None if self._strict_nonidle else image_transforms,
+                delta_timestamps=None if self._strict_nonidle else child_delta_timestamps,
                 tolerance_s=self.tolerances_s[ds_name],
                 download_videos=download_videos,
                 video_backend=video_backend,
             )
+            delta_indices = (
+                get_delta_indices(child_delta_timestamps, int(getattr(dataset, "fps")))
+                if child_delta_timestamps is not None
+                else None
+            )
+            return dataset, delta_indices
 
         def build_entry(dataset_idx: int, ds_root: Path, ds_name: str) -> tuple[int, _V3DatasetEntry]:
             try:
                 selected_episodes = episodes[ds_name] if episodes else None
-                dataset = build_dataset(dataset_idx, ds_root, ds_name, selected_episodes)
+                dataset, delta_indices = build_dataset(dataset_idx, ds_root, ds_name, selected_episodes)
                 entry = _V3DatasetEntry(
                     dataset=dataset,
                     root=ds_root,
                     repo_id=ds_name,
                     episodes=list(selected_episodes) if selected_episodes is not None else None,
+                    delta_indices=delta_indices,
                 )
                 return dataset_idx, entry
             except Exception as exc:
@@ -354,6 +367,8 @@ class MultiLeRobotDatasetV3(torch.utils.data.Dataset):
             )
 
         filtered_indices: list[int] = []
+        keep_by_episode_pos: list[list[int]] = []
+        raw_to_rank: dict[int, int] = {}
         global_episode_pos = 0
         for entry, lengths in zip(self._datasets, self._episode_lengths_by_dataset, strict=True):
             episode_indices = self._entry_episode_indices(entry)
@@ -368,7 +383,7 @@ class MultiLeRobotDatasetV3(torch.utils.data.Dataset):
                 ep_end = int(self.episode_data_index["to"][global_episode_pos].item())
                 ranges = episode_ranges.get(str(episode_idx), episode_ranges.get(int(episode_idx), None))
                 if ranges is None:
-                    keep_indices = range(ep_start, ep_end)
+                    keep_indices = list(range(ep_start, ep_end))
                 else:
                     keep_list: list[int] = []
                     episode_len = int(lengths[local_episode_pos])
@@ -379,13 +394,19 @@ class MultiLeRobotDatasetV3(torch.utils.data.Dataset):
                             continue
                         keep_list.extend(range(ep_start + start, ep_start + end))
                     keep_indices = sorted(set(keep_list))
-                filtered_indices.extend(int(idx) for idx in keep_indices)
+                keep_indices = [int(idx) for idx in keep_indices]
+                keep_by_episode_pos.append(keep_indices)
+                for keep_rank, raw_idx in enumerate(keep_indices):
+                    raw_to_rank[int(raw_idx)] = keep_rank
+                filtered_indices.extend(keep_indices)
                 global_episode_pos += 1
 
         if len(filtered_indices) == 0:
             raise ValueError(f"Non-idle filter removed all frames: {self.nonidle_filter_path}")
 
         self._nonidle_filtered_indices = filtered_indices
+        self._nonidle_keep_indices_by_episode_pos = keep_by_episode_pos
+        self._nonidle_raw_index_to_keep_rank = raw_to_rank
         logger.info(
             "Loaded LeRobot v3 non-idle filter %s: kept %d/%d frames.",
             self.nonidle_filter_path,
@@ -406,10 +427,26 @@ class MultiLeRobotDatasetV3(torch.utils.data.Dataset):
             return json.load(f)
 
     @staticmethod
-    def _root_signature(root: Path) -> dict[str, int]:
+    def _root_signature(root: Path) -> dict[str, Any]:
         info_path = root / "meta" / "info.json"
-        stat = info_path.stat()
-        return {"info_mtime_ns": int(stat.st_mtime_ns), "info_size": int(stat.st_size)}
+        info_stat = info_path.stat()
+        episodes_dir = root / "meta" / "episodes"
+        episode_files = []
+        if episodes_dir.exists():
+            for path in sorted(episodes_dir.rglob("*.parquet")):
+                stat = path.stat()
+                episode_files.append(
+                    {
+                        "path": str(path.relative_to(root)),
+                        "mtime_ns": int(stat.st_mtime_ns),
+                        "size": int(stat.st_size),
+                    }
+                )
+        return {
+            "info_mtime_ns": int(info_stat.st_mtime_ns),
+            "info_size": int(info_stat.st_size),
+            "episodes": episode_files,
+        }
 
     @staticmethod
     def _episodes_signature(episodes: list[int] | None) -> list[int] | None:
@@ -573,6 +610,14 @@ class MultiLeRobotDatasetV3(torch.utils.data.Dataset):
         local_idx = idx - self._frame_offsets[dataset_idx]
         return dataset_idx, local_idx
 
+    def _resolve_episode_pos_for_frame(self, idx: int) -> int:
+        starts = self.episode_data_index["from"]
+        ends = self.episode_data_index["to"]
+        episode_pos = bisect_right(starts.tolist(), int(idx)) - 1
+        if episode_pos < 0 or int(idx) >= int(ends[episode_pos].item()):
+            raise IndexError(f"Frame index {idx} is not contained in any episode.")
+        return int(episode_pos)
+
     def _resolve_episode_index(self, episode_idx: int) -> tuple[int, int]:
         if episode_idx < 0 or episode_idx >= self.num_episodes:
             raise IndexError(f"Episode index {episode_idx} out of bounds.")
@@ -581,9 +626,11 @@ class MultiLeRobotDatasetV3(torch.utils.data.Dataset):
         return dataset_idx, local_episode_idx
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        if self._nonidle_filtered_indices is not None:
+            return self._getitem_strict_nonidle(idx)
+
         profile_on = _PROFILE_CTX.get() is not None
-        raw_idx = int(self._nonidle_filtered_indices[idx]) if self._nonidle_filtered_indices is not None else idx
-        dataset_idx, local_idx = self._resolve_frame_index(raw_idx)
+        dataset_idx, local_idx = self._resolve_frame_index(idx)
         t0 = time.perf_counter() if profile_on else 0.0
         item = dict(self._datasets[dataset_idx].dataset[local_idx])
         if profile_on:
@@ -597,6 +644,188 @@ class MultiLeRobotDatasetV3(torch.utils.data.Dataset):
             if profile_on:
                 _profile_add("v3.hetero_bridge", time.perf_counter() - t0)
         return item
+
+    def _getitem_strict_nonidle(self, idx: int) -> dict[str, torch.Tensor]:
+        if idx < 0 or idx >= len(self):
+            raise IndexError(f"Index {idx} out of bounds.")
+        if (
+            self._nonidle_filtered_indices is None
+            or self._nonidle_keep_indices_by_episode_pos is None
+            or self._nonidle_raw_index_to_keep_rank is None
+        ):
+            raise RuntimeError("Strict non-idle tables are not initialized.")
+
+        profile_on = _PROFILE_CTX.get() is not None
+        raw_idx = int(self._nonidle_filtered_indices[idx])
+        dataset_idx, local_idx = self._resolve_frame_index(raw_idx)
+        entry = self._datasets[dataset_idx]
+        t0 = time.perf_counter() if profile_on else 0.0
+
+        item = self._load_anchor_item(entry, local_idx)
+        if profile_on:
+            t1 = time.perf_counter()
+            _profile_add("v3.strict.anchor_get", t1 - t0)
+            t0 = t1
+
+        if entry.delta_indices is not None:
+            episode_pos = self._resolve_episode_pos_for_frame(raw_idx)
+            query_indices, padding = self._get_strict_nonidle_query_indices(
+                raw_idx,
+                episode_pos,
+                entry.delta_indices,
+            )
+            item = {**item, **padding}
+            query_result = self._query_strict_nonidle(entry, dataset_idx, query_indices)
+            item.update(query_result)
+            if profile_on:
+                t1 = time.perf_counter()
+                _profile_add("v3.strict.query", t1 - t0)
+                t0 = t1
+
+        self._apply_image_transforms(item, entry)
+        self._ensure_task_string(item, entry)
+        item["dataset_index"] = torch.tensor(dataset_idx)
+        if self.hetero_bridge is not None:
+            item = self.hetero_bridge.format_item(item, dataset_idx)
+            item["dataset_index"] = torch.tensor(dataset_idx)
+            if profile_on:
+                _profile_add("v3.hetero_bridge", time.perf_counter() - t0)
+        return item
+
+    def _get_strict_nonidle_query_indices(
+        self,
+        raw_idx: int,
+        episode_pos: int,
+        delta_indices: dict[str, list[int]],
+    ) -> tuple[dict[str, list[int]], dict[str, torch.Tensor]]:
+        if self._nonidle_keep_indices_by_episode_pos is None or self._nonidle_raw_index_to_keep_rank is None:
+            raise RuntimeError("Strict non-idle tables are not initialized.")
+        keep_indices = self._nonidle_keep_indices_by_episode_pos[episode_pos]
+        if len(keep_indices) == 0:
+            raise IndexError(f"Episode position {episode_pos} has no non-idle frames.")
+        if raw_idx not in self._nonidle_raw_index_to_keep_rank:
+            raise IndexError(f"Raw index {raw_idx} is not in the non-idle filter.")
+
+        keep_rank = self._nonidle_raw_index_to_keep_rank[raw_idx]
+        query_indices: dict[str, list[int]] = {}
+        padding: dict[str, torch.Tensor] = {}
+        for key, deltas in delta_indices.items():
+            cur_indices = []
+            cur_padding = []
+            for delta in deltas:
+                target_rank = keep_rank + int(delta)
+                is_pad = target_rank < 0 or target_rank >= len(keep_indices)
+                clamped_rank = max(0, min(len(keep_indices) - 1, target_rank))
+                cur_indices.append(int(keep_indices[clamped_rank]))
+                cur_padding.append(bool(is_pad))
+            query_indices[key] = cur_indices
+            padding[f"{key}_is_pad"] = torch.BoolTensor(cur_padding)
+        return query_indices, padding
+
+    def _load_anchor_item(self, entry: _V3DatasetEntry, local_idx: int) -> dict[str, Any]:
+        if self.during_training:
+            return dict(entry.dataset[local_idx])
+        return dict(self._get_raw_item(entry, local_idx))
+
+    def _query_strict_nonidle(
+        self,
+        entry: _V3DatasetEntry,
+        dataset_idx: int,
+        query_indices: dict[str, list[int]],
+    ) -> dict[str, torch.Tensor]:
+        result: dict[str, torch.Tensor] = {}
+        visual_keys = self._camera_keys(entry)
+        depth_keys = self._depth_keys(entry)
+        raw_cache: dict[int, dict[str, Any]] = {}
+        full_cache: dict[int, dict[str, Any]] = {}
+
+        for key, global_indices in query_indices.items():
+            if key in visual_keys and not self.during_training:
+                continue
+            values = []
+            for global_idx in global_indices:
+                q_dataset_idx, q_local_idx = self._resolve_frame_index(int(global_idx))
+                if q_dataset_idx != dataset_idx:
+                    raise RuntimeError(
+                        "Strict non-idle query crossed dataset boundaries, which should be impossible "
+                        f"within one episode: anchor_dataset={dataset_idx}, query_dataset={q_dataset_idx}"
+                    )
+                if key in visual_keys:
+                    sample = full_cache.get(q_local_idx)
+                    if sample is None:
+                        sample = dict(entry.dataset[q_local_idx])
+                        full_cache[q_local_idx] = sample
+                else:
+                    sample = raw_cache.get(q_local_idx)
+                    if sample is None:
+                        sample = dict(self._get_raw_item(entry, q_local_idx))
+                        raw_cache[q_local_idx] = sample
+                values.append(self._as_tensor_for_stack(sample[key]))
+
+            if len(values) == 0:
+                continue
+            stacked = torch.stack(values, dim=0)
+            result[key] = stacked
+        return result
+
+    def _apply_image_transforms(self, item: dict[str, Any], entry: _V3DatasetEntry) -> None:
+        if self.image_transforms is None:
+            return
+        for key in self._camera_keys(entry).difference(self._depth_keys(entry)):
+            if key in item:
+                item[key] = self.image_transforms(item[key])
+
+    @staticmethod
+    def _as_tensor_for_stack(value: Any) -> torch.Tensor:
+        if isinstance(value, torch.Tensor):
+            return value
+        return torch.as_tensor(value)
+
+    @staticmethod
+    def _get_raw_item(entry: _V3DatasetEntry, local_idx: int) -> dict[str, Any]:
+        if hasattr(entry.dataset, "get_raw_item"):
+            return entry.dataset.get_raw_item(local_idx)
+        return entry.dataset[local_idx]
+
+    @staticmethod
+    def _camera_keys(entry: _V3DatasetEntry) -> set[str]:
+        meta = getattr(entry.dataset, "meta", None)
+        camera_keys = getattr(meta, "camera_keys", None)
+        if camera_keys is not None:
+            return set(camera_keys)
+        features = getattr(meta, "features", {}) if meta is not None else {}
+        return {
+            key
+            for key, feature in features.items()
+            if isinstance(feature, dict) and feature.get("dtype") in {"image", "video"}
+        }
+
+    @staticmethod
+    def _depth_keys(entry: _V3DatasetEntry) -> set[str]:
+        meta = getattr(entry.dataset, "meta", None)
+        depth_keys = getattr(meta, "depth_keys", None)
+        return set(depth_keys or [])
+
+    @staticmethod
+    def _scalar_to_int(value: Any) -> int:
+        if hasattr(value, "item"):
+            value = value.item()
+        return int(value)
+
+    def _ensure_task_string(self, item: dict[str, Any], entry: _V3DatasetEntry) -> None:
+        if "task" in item or "task_index" not in item:
+            return
+        meta = getattr(entry.dataset, "meta", None)
+        tasks = getattr(meta, "tasks", None)
+        if tasks is None:
+            return
+        task_idx = self._scalar_to_int(item["task_index"])
+        if hasattr(tasks, "iloc"):
+            item["task"] = tasks.iloc[task_idx].name
+        elif isinstance(tasks, dict):
+            item["task"] = tasks[task_idx]
+        else:
+            item["task"] = tasks[task_idx]
 
     def get_episode_data(self, episode_idx: int) -> dict[str, torch.Tensor]:
         dataset_idx, local_episode_idx = self._resolve_episode_index(episode_idx)
