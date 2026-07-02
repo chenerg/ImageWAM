@@ -26,6 +26,10 @@ gradient_accumulation_steps: 6
 weight_decay: 1e-2
 resume: null
 
+model:
+  proprio_dim: ${data.train.processor.proprio_output_dim}
+  pack_proprio_after_text: true
+
 wandb:
   enabled: true
   project: imagewam

@@ -8,8 +8,8 @@ defaults:
 data:
   train:
     require_text_cache: false
-    qwen_text_cache_dir: ???
-    qwen_context_len: 512
+    qwen_text_cache_dir: ${data.data_root}/flux2_qwen3_cache_9b
+    qwen_context_len: 128
     qwen_text_cache_format: qwen3_flux2
 
 batch_size: 4

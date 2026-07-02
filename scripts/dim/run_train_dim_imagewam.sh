@@ -10,7 +10,6 @@ GPU_PER_NODE="${GPU_PER_NODE:-8}"
 TASK_TYPE="${TASK_TYPE:-libero}"
 MODEL_ROOT="${MODEL_ROOT:-${REPO_ROOT}/checkpoints}"
 
-imagewam_require_env DATA_ROOT
 imagewam_require_env DIM_SRC
 DIM_MODEL_PATH="${DIM_MODEL_PATH:-${MODEL_ROOT}/DIM/DIM-4.6B-Edit}"
 QWEN_MODEL_PATH="${QWEN_MODEL_PATH:-${MODEL_ROOT}/Qwen/Qwen2.5-VL-3B-Instruct}"
@@ -32,11 +31,10 @@ if [ "${REBUILD_DIM_ACTION_INIT:-false}" = "true" ] || [ ! -f "${ACTION_INIT}" ]
     --output "${ACTION_INIT}"
 fi
 
-imagewam_print_config DATA_ROOT DIM_SRC DIM_MODEL_PATH QWEN_MODEL_PATH SANA_CONFIG_PATH ACTION_INIT
+imagewam_print_config DIM_SRC DIM_MODEL_PATH QWEN_MODEL_PATH SANA_CONFIG_PATH ACTION_INIT
 TASK=libero_dim_imagewam imagewam_run bash scripts/dim/train_dim_imagewam.sh "${GPU_PER_NODE}" \
   model.dim_model_path="${DIM_MODEL_PATH}" \
   model.sana_config_path="${SANA_CONFIG_PATH}" \
   model.qwen_path="${QWEN_MODEL_PATH}" \
-  data.train.dataset_dirs="[${DATA_ROOT}/libero_spatial_no_noops_lerobot,${DATA_ROOT}/libero_object_no_noops_lerobot,${DATA_ROOT}/libero_goal_no_noops_lerobot,${DATA_ROOT}/libero_10_no_noops_lerobot]" \
   model.action_dit_pretrained_path="${ACTION_INIT}" \
   "$@"

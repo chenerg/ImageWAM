@@ -1,10 +1,13 @@
+data_root: ./data/libero_mujoco3.3.2
+text_embedding_cache_dir: ./data/text_embeds_cache/libero
+
 train:
   _target_: imagewam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
   dataset_dirs:
-    - ${oc.env:IMAGEWAM_LIBERO_DATA_ROOT,./data/libero_mujoco3.3.2}/libero_spatial_no_noops_lerobot
-    - ${oc.env:IMAGEWAM_LIBERO_DATA_ROOT,./data/libero_mujoco3.3.2}/libero_object_no_noops_lerobot
-    - ${oc.env:IMAGEWAM_LIBERO_DATA_ROOT,./data/libero_mujoco3.3.2}/libero_goal_no_noops_lerobot
-    - ${oc.env:IMAGEWAM_LIBERO_DATA_ROOT,./data/libero_mujoco3.3.2}/libero_10_no_noops_lerobot
+    - ${data.data_root}/libero_spatial_no_noops_lerobot
+    - ${data.data_root}/libero_object_no_noops_lerobot
+    - ${data.data_root}/libero_goal_no_noops_lerobot
+    - ${data.data_root}/libero_10_no_noops_lerobot
   shape_meta:
     images:
       - key: image
@@ -64,5 +67,5 @@ train:
       - _target_: imagewam.datasets.lerobot.transforms.image.ToTensor
       - _target_: torchvision.transforms.Resize
         size: [224, 224]
-  text_embedding_cache_dir: ${oc.env:IMAGEWAM_LIBERO_TEXT_CACHE_DIR,./data/text_embeds_cache/libero}
+  text_embedding_cache_dir: ${data.text_embedding_cache_dir}
   context_len: 128

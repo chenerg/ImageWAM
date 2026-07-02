@@ -1,6 +1,12 @@
+data_root: ./data/robotwin2.0
+robotwin_root: ${data.data_root}/robotwin2.0
+qwen_cache_dir: ${data.robotwin_root}/qwen_cache
+nonidle_filter_path: ${data.robotwin_root}/nonidle_ranges.json
+
 train:
   _target_: imagewam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
-  dataset_dirs: ???
+  dataset_dirs:
+    - ${data.robotwin_root}
   shape_meta:
     images:
       - key: cam_high
@@ -27,7 +33,7 @@ train:
   camera_key: null
   val_set_proportion: 0.01
   is_training_set: true
-  pretrained_norm_stats: ./data/robotwin2.0/dataset_stats.json
+  pretrained_norm_stats: ${data.data_root}/dataset_stats.json
   skip_padding_as_possible: false
   concat_multi_camera: "robotwin"
   robotwin_camera_layout: "compact_288x256"
@@ -52,8 +58,8 @@ train:
       fill: mean
   require_text_cache: false
   endpoint_frames_only: true
-  nonidle_filter_path: null
-  qwen_text_cache_dir: ???
+  nonidle_filter_path: ${data.nonidle_filter_path}
+  qwen_text_cache_dir: ${data.qwen_cache_dir}
   qwen_context_len: 128
   processor:
     _target_: imagewam.datasets.lerobot.processors.imagewam_processor.ImageWAMProcessor
@@ -88,7 +94,8 @@ train:
 
 val:
   _target_: imagewam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
-  dataset_dirs: ???
+  dataset_dirs:
+    - ${data.robotwin_root}
   shape_meta:
     images:
       - key: cam_high
@@ -122,8 +129,8 @@ val:
   video_augmentation: null
   require_text_cache: false
   endpoint_frames_only: true
-  nonidle_filter_path: null
-  qwen_text_cache_dir: ???
+  nonidle_filter_path: ${data.nonidle_filter_path}
+  qwen_text_cache_dir: ${data.qwen_cache_dir}
   qwen_context_len: 128
   processor:
     _target_: imagewam.datasets.lerobot.processors.imagewam_processor.ImageWAMProcessor

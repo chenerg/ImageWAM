@@ -1,6 +1,12 @@
+data_root: ./data/libero_mujoco3.3.2
+
 train:
   _target_: imagewam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
-  dataset_dirs: ???
+  dataset_dirs:
+    - ${data.data_root}/libero_spatial_no_noops_lerobot
+    - ${data.data_root}/libero_object_no_noops_lerobot
+    - ${data.data_root}/libero_goal_no_noops_lerobot
+    - ${data.data_root}/libero_10_no_noops_lerobot
   shape_meta:
     images:
       - key: image
@@ -49,7 +55,7 @@ train:
       ev_range: [-0.25, 0.25]
   require_text_cache: false
   endpoint_frames_only: true
-  qwen_text_cache_dir: ???
+  qwen_text_cache_dir: ${data.data_root}/text_embeds_cache
   qwen_context_len: 128
   pretrained_norm_stats: null
   processor:

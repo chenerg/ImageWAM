@@ -6,11 +6,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../common.sh"
 imagewam_init "${SCRIPT_DIR}/../.."
 
-imagewam_require_env ROBOTWIN_ROOT
-NONIDLE_FILTER_PATH="${NONIDLE_FILTER_PATH:-${ROBOTWIN_ROOT}/nonidle_ranges.json}"
+config_values="$(
+  imagewam_python -c 'from pathlib import Path
+from hydra import compose, initialize_config_dir
+from omegaconf import OmegaConf
 
-imagewam_print_config ROBOTWIN_ROOT NONIDLE_FILTER_PATH
+with initialize_config_dir(config_dir=str(Path("configs").resolve()), version_base="1.3"):
+    cfg = compose(config_name="train", overrides=["data=robotwin_omnigen2"])
+resolved = OmegaConf.to_container(cfg.data, resolve=True)
+print(resolved["robotwin_root"])
+print(resolved["nonidle_filter_path"])
+'
+)"
+robotwin_root="$(printf '%s\n' "${config_values}" | sed -n '1p')"
+nonidle_filter_path="$(printf '%s\n' "${config_values}" | sed -n '2p')"
+
+imagewam_print_config robotwin_root nonidle_filter_path
 imagewam_run imagewam_python scripts/data/compute_robotwin_nonidle_ranges.py \
-  "${ROBOTWIN_ROOT}" \
-  --output "${NONIDLE_FILTER_PATH}" \
+  "${robotwin_root}" \
+  --output "${nonidle_filter_path}" \
   "$@"

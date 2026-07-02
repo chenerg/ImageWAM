@@ -64,7 +64,6 @@ Shell entrypoints under `scripts/` automatically read `.env.local`. You can writ
 Common variables:
 
 ```bash
-export DATA_ROOT=/path/to/datasets # Each dataset uses its own data root.
 export MODEL_ROOT=/path/to/model/checkpoints # Used to store checkpoints.
 export OUTPUT_ROOT=./runs
 ```
@@ -170,10 +169,10 @@ data/libero_mujoco3.3.2/
 └── libero_spatial_no_noops_lerobot/
 ```
 
-Set this when running LIBERO training or evaluation:
+The default LIBERO training configs already point to this layout. If your dataset lives elsewhere, edit `data_root` in `configs/data/libero_omnigen2_pair.yaml`:
 
-```bash
-export DATA_ROOT="$(pwd)/data/libero_mujoco3.3.2"
+```yaml
+data_root: ./data/libero_mujoco3.3.2
 ```
 
 ### RoboTwin
@@ -203,11 +202,13 @@ data/robotwin2.0/
     └── videos/
 ```
 
-Set these when running RoboTwin training or evaluation:
+The default RoboTwin training configs already point to this layout. If your dataset lives elsewhere, edit these fields in `configs/data/robotwin_omnigen2.yaml`:
 
-```bash
-export DATA_ROOT="$(pwd)/data/robotwin2.0"
-export ROBOTWIN_ROOT="${DATA_ROOT}/robotwin2.0"
+```yaml
+data_root: ./data/robotwin2.0
+robotwin_root: ${data.data_root}/robotwin2.0
+qwen_cache_dir: ${data.robotwin_root}/qwen_cache
+nonidle_filter_path: ${data.robotwin_root}/nonidle_ranges.json
 ```
 
 To filter no-op frames in RoboTwin, we use a precomputed JSON file. It can be generated with:
@@ -216,7 +217,7 @@ To filter no-op frames in RoboTwin, we use a precomputed JSON file. It can be ge
 bash scripts/data/precompute_noops_lerobot.sh
 ```
 
-By default, this generates `${ROBOTWIN_ROOT}/nonidle_ranges.json`.
+By default, this reads `robotwin_root` and writes to `nonidle_filter_path` from `configs/data/robotwin_omnigen2.yaml`.
 
 ## Benchmark Environments
 
@@ -258,8 +259,6 @@ Training wrappers automatically generate ActionDiT initialization weights if `AC
 LIBERO:
 
 ```bash
-export DATA_ROOT="$(pwd)/data/libero_mujoco3.3.2"
-
 GPU_PER_NODE=8 \
 TASK_TYPE=libero \
 FLUX2_VARIANT=4b \
@@ -270,9 +269,6 @@ bash scripts/flux2/run_train_flux2_klein_imagewam.sh
 RoboTwin:
 
 ```bash
-export DATA_ROOT="$(pwd)/data/robotwin2.0"
-export ROBOTWIN_ROOT="${DATA_ROOT}/robotwin2.0"
-
 GPU_PER_NODE=8 \
 TASK_TYPE=robotwin \
 FLUX2_VARIANT=4b \
@@ -285,17 +281,16 @@ Common FLUX.2 overrides:
 ```bash
 export FLUX2_VARIANT=4b          # 4b or 9b
 export ZERO_STAGE=1              # 1/zero1 or 2/zero2
-export QWEN_CACHE_DIR=/path/to/qwen3/cache # Optional; generated automatically if unset.
 export ACTION_INIT=/path/to/action_dit_flux2_init.pt # Optional; generated automatically if unset.
 ```
+
+FLUX.2 Qwen cache paths are configured in the task YAML files, for example `data.train.qwen_text_cache_dir` in `configs/task/libero_flux2_klein_4b_base_imagewam.yaml` or `configs/task/robotwin_flux2_klein_4b_base_imagewam.yaml`.
 
 ### OmniGen2
 
 LIBERO:
 
 ```bash
-export DATA_ROOT="$(pwd)/data/libero_mujoco3.3.2"
-
 GPU_PER_NODE=8 \
 TASK_TYPE=libero \
 PRECOMPUTE_QWEN_CACHE=true \
@@ -305,9 +300,6 @@ bash scripts/omnigen2/run_train_imagewam.sh
 RoboTwin:
 
 ```bash
-export DATA_ROOT="$(pwd)/data/robotwin2.0"
-export ROBOTWIN_ROOT="${DATA_ROOT}/robotwin2.0"
-
 GPU_PER_NODE=8 \
 TASK_TYPE=robotwin \
 PRECOMPUTE_QWEN_CACHE=true \
@@ -319,8 +311,6 @@ bash scripts/omnigen2/run_train_imagewam.sh
 LIBERO:
 
 ```bash
-export DATA_ROOT="$(pwd)/data/libero_mujoco3.3.2"
-
 GPU_PER_NODE=8 \
 TASK_TYPE=libero \
 bash scripts/ovis_u1/run_train_ovis_u1_imagewam.sh
@@ -329,9 +319,6 @@ bash scripts/ovis_u1/run_train_ovis_u1_imagewam.sh
 RoboTwin:
 
 ```bash
-export DATA_ROOT="$(pwd)/data/robotwin2.0"
-export ROBOTWIN_ROOT="${DATA_ROOT}/robotwin2.0"
-
 GPU_PER_NODE=8 \
 TASK_TYPE=robotwin \
 bash scripts/ovis_u1/run_train_ovis_u1_imagewam.sh
@@ -479,4 +466,3 @@ If you find this repository helpful for your research, please cite our paper:
       url={https://arxiv.org/abs/2606.19531}, 
 }
 ```
-

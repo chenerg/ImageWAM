@@ -64,7 +64,6 @@ cp .env.example .env.local
 常用变量：
 
 ```bash
-export DATA_ROOT=/path/to/datasets # 对于不同的数据集有各自的data_root
 export MODEL_ROOT=/path/to/model/checkpoints # 用于存放checkpoint 
 export OUTPUT_ROOT=./runs
 ```
@@ -169,10 +168,10 @@ data/libero_mujoco3.3.2/
 └── libero_spatial_no_noops_lerobot/
 ```
 
-运行 LIBERO 训练或评测时设置：
+默认 LIBERO 训练配置已经指向这个目录结构。如果数据放在其他位置，修改 `configs/data/libero_omnigen2_pair.yaml` 里的 `data_root`：
 
-```bash
-export DATA_ROOT="$(pwd)/data/libero_mujoco3.3.2"
+```yaml
+data_root: ./data/libero_mujoco3.3.2
 ```
 
 ### RoboTwin
@@ -202,11 +201,13 @@ data/robotwin2.0/
     └── videos/
 ```
 
-运行 RoboTwin 训练或评测时设置：
+默认 RoboTwin 训练配置已经指向这个目录结构。如果数据放在其他位置，修改 `configs/data/robotwin_omnigen2.yaml` 里的这些字段：
 
-```bash
-export DATA_ROOT="$(pwd)/data/robotwin2.0"
-export ROBOTWIN_ROOT="${DATA_ROOT}/robotwin2.0"
+```yaml
+data_root: ./data/robotwin2.0
+robotwin_root: ${data.data_root}/robotwin2.0
+qwen_cache_dir: ${data.robotwin_root}/qwen_cache
+nonidle_filter_path: ${data.robotwin_root}/nonidle_ranges.json
 ```
 
 为了过滤 RoboTwin中的no-ops帧，我们使用了预先计算的过滤json，这可以通过如下json得到。
@@ -215,7 +216,7 @@ export ROBOTWIN_ROOT="${DATA_ROOT}/robotwin2.0"
 bash scripts/data/precompute_noops_lerobot.sh
 ```
 
-默认会生成 `${ROBOTWIN_ROOT}/nonidle_ranges.json`。
+默认会读取 `configs/data/robotwin_omnigen2.yaml` 里的 `robotwin_root`，并写入其中的 `nonidle_filter_path`。
 
 ## Benchmark 环境
 
@@ -257,8 +258,6 @@ assets 准备细节请参考 `third_party/RoboTwin/README.vendor.md` 和 RoboTwi
 LIBERO：
 
 ```bash
-export DATA_ROOT="$(pwd)/data/libero_mujoco3.3.2"
-
 GPU_PER_NODE=8 \
 TASK_TYPE=libero \
 FLUX2_VARIANT=4b \
@@ -269,9 +268,6 @@ bash scripts/flux2/run_train_flux2_klein_imagewam.sh
 RoboTwin：
 
 ```bash
-export DATA_ROOT="$(pwd)/data/robotwin2.0"
-export ROBOTWIN_ROOT="${DATA_ROOT}/robotwin2.0"
-
 GPU_PER_NODE=8 \
 TASK_TYPE=robotwin \
 FLUX2_VARIANT=4b \
@@ -284,17 +280,16 @@ bash scripts/flux2/run_train_flux2_klein_imagewam.sh
 ```bash
 export FLUX2_VARIANT=4b          # 4b 或 9b
 export ZERO_STAGE=1              # 1/zero1 或 2/zero2
-export QWEN_CACHE_DIR=/path/to/qwen3/cache # 可选，不设置时会自动生成
 export ACTION_INIT=/path/to/action_dit_flux2_init.pt # 可选，不设置时自动生成
 ```
+
+FLUX.2 的 Qwen cache 路径在 task YAML 中配置，例如 `configs/task/libero_flux2_klein_4b_base_imagewam.yaml` 或 `configs/task/robotwin_flux2_klein_4b_base_imagewam.yaml` 里的 `data.train.qwen_text_cache_dir`。
 
 ### OmniGen2
 
 LIBERO：
 
 ```bash
-export DATA_ROOT="$(pwd)/data/libero_mujoco3.3.2"
-
 GPU_PER_NODE=8 \
 TASK_TYPE=libero \
 PRECOMPUTE_QWEN_CACHE=true \
@@ -304,9 +299,6 @@ bash scripts/omnigen2/run_train_imagewam.sh
 RoboTwin：
 
 ```bash
-export DATA_ROOT="$(pwd)/data/robotwin2.0"
-export ROBOTWIN_ROOT="${DATA_ROOT}/robotwin2.0"
-
 GPU_PER_NODE=8 \
 TASK_TYPE=robotwin \
 PRECOMPUTE_QWEN_CACHE=true \
@@ -318,8 +310,6 @@ bash scripts/omnigen2/run_train_imagewam.sh
 LIBERO：
 
 ```bash
-export DATA_ROOT="$(pwd)/data/libero_mujoco3.3.2"
-
 GPU_PER_NODE=8 \
 TASK_TYPE=libero \
 bash scripts/ovis_u1/run_train_ovis_u1_imagewam.sh
@@ -328,9 +318,6 @@ bash scripts/ovis_u1/run_train_ovis_u1_imagewam.sh
 RoboTwin：
 
 ```bash
-export DATA_ROOT="$(pwd)/data/robotwin2.0"
-export ROBOTWIN_ROOT="${DATA_ROOT}/robotwin2.0"
-
 GPU_PER_NODE=8 \
 TASK_TYPE=robotwin \
 bash scripts/ovis_u1/run_train_ovis_u1_imagewam.sh
@@ -474,4 +461,3 @@ ImageWAM 基于以下多个代码库构建：
   note   = {TODO: add arXiv or conference information}
 }
 ```
-

@@ -8,13 +8,13 @@ defaults:
 data:
   train:
     require_text_cache: false
-    qwen_text_cache_dir: ???
-    qwen_context_len: 512
+    qwen_text_cache_dir: ${data.robotwin_root}/flux2_qwen3_cache_9b
+    qwen_context_len: 128
     qwen_text_cache_format: qwen3_flux2
   val:
     require_text_cache: false
-    qwen_text_cache_dir: ???
-    qwen_context_len: 512
+    qwen_text_cache_dir: ${data.train.qwen_text_cache_dir}
+    qwen_context_len: 128
     qwen_text_cache_format: qwen3_flux2
 
 batch_size: 4
@@ -38,6 +38,7 @@ resume: null
 
 model:
   proprio_dim: ${data.train.processor.proprio_output_dim}
+  qwen_context_len: 128
 
 wandb:
   enabled: true
