@@ -65,6 +65,13 @@ class Wan22Trainer:
                 f"Unsupported mixed_precision: {cfg.mixed_precision}. "
                 "Expected one of: ['no', 'fp16', 'bf16']."
             )
+        tensorboard_cfg = cfg.get("tensorboard", None)
+        self.tensorboard_enabled = (
+            bool(tensorboard_cfg.get("enabled", True)) if tensorboard_cfg is not None else True
+        )
+        self.tensorboard_log_dir = (
+            tensorboard_cfg.get("log_dir", None) if tensorboard_cfg is not None else None
+        )
         self.wandb_enabled = bool(cfg.wandb.enabled)
 
         self.accelerator = Accelerator(
@@ -154,12 +161,39 @@ class Wan22Trainer:
             self.model, self.optimizer, self.train_loader, self.scheduler
         )
         self.optimizer.zero_grad(set_to_none=True)
+        self.tensorboard_writer = None
         self.wandb_run = None
-        self._init_wandb()
-        self._resume_or_load_checkpoint()
+        try:
+            self._init_tensorboard()
+            self._init_wandb()
+            self._resume_or_load_checkpoint()
+        except Exception:
+            self._finish_loggers()
+            raise
 
         val_size = len(self.val_dataset) if self.val_dataset is not None else len(self.train_dataset)
         logger.info("Train/val dataset size: %d/%d", len(self.train_dataset), val_size)
+
+    def _init_tensorboard(self):
+        if not self.tensorboard_enabled or not self.accelerator.is_main_process:
+            return
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ImportError as e:
+            raise ImportError(
+                "TensorBoard logging is enabled in config (`tensorboard.enabled=true`) "
+                "but tensorboard is not installed. Install tensorboard or set "
+                "`tensorboard.enabled=false`."
+            ) from e
+
+        log_dir = self.tensorboard_log_dir
+        if log_dir in (None, "null", ""):
+            log_dir = Path(self.output_dir) / "tensorboard"
+        else:
+            log_dir = Path(str(log_dir))
+        ensure_dir(str(log_dir))
+        self.tensorboard_writer = SummaryWriter(log_dir=str(log_dir))
+        logger.info("Initialized TensorBoard writer: log_dir=%s", log_dir)
 
     def _init_wandb(self):
         if not self.wandb_enabled or not self.accelerator.is_main_process:
@@ -191,11 +225,41 @@ class Wan22Trainer:
             return
         self.wandb_run.log(payload, step=self.global_step)
 
+    def _tensorboard_log(self, payload: dict):
+        if self.tensorboard_writer is None:
+            return
+        for key, value in payload.items():
+            if isinstance(value, (int, float, np.number)):
+                self.tensorboard_writer.add_scalar(key, float(value), self.global_step)
+
+    def _log_metrics(self, payload: dict):
+        self._tensorboard_log(payload)
+        self._wandb_log(payload)
+
+    def _finish_tensorboard(self):
+        if self.tensorboard_writer is None:
+            return
+        try:
+            self.tensorboard_writer.flush()
+            self.tensorboard_writer.close()
+        except Exception:
+            logger.exception("Failed to close TensorBoard writer cleanly.")
+        finally:
+            self.tensorboard_writer = None
+
     def _finish_wandb(self):
         if self.wandb_run is None:
             return
-        self.wandb_run.finish()
-        self.wandb_run = None
+        try:
+            self.wandb_run.finish()
+        except Exception:
+            logger.exception("Failed to finish wandb run cleanly.")
+        finally:
+            self.wandb_run = None
+
+    def _finish_loggers(self):
+        self._finish_tensorboard()
+        self._finish_wandb()
 
     def _build_loader(self, dataset, worker_init_fn=None):
         self.train_sampler = ResumableEpochSampler(
@@ -1021,6 +1085,12 @@ class Wan22Trainer:
         )
 
     def train(self):
+        try:
+            return self._train_impl()
+        finally:
+            self._finish_loggers()
+
+    def _train_impl(self):
         self._set_dit_only_train_mode()
 
         unwrapped_model = self.accelerator.unwrap_model(self.model)
@@ -1158,7 +1228,7 @@ class Wan22Trainer:
                         )
                         logger.info(description)
 
-                        wandb_payload = {
+                        metrics_payload = {
                             "train/loss": global_loss,
                             "train/grad_norm": global_grad_norm,
                             "train/lr": current_lr,
@@ -1166,8 +1236,8 @@ class Wan22Trainer:
                             "performance/samples_per_sec": steps_per_sec * self.batch_size * self.accelerator.num_processes,
                         }
                         for key, value in global_loss_metrics.items():
-                            wandb_payload[f"train/{key}"] = value
-                        self._wandb_log(wandb_payload)
+                            metrics_payload[f"train/{key}"] = value
+                        self._log_metrics(metrics_payload)
 
                     if should_log_timer and self.accelerator.is_main_process:
                         logger.info(
@@ -1210,7 +1280,7 @@ class Wan22Trainer:
                                 eval_payload["eval/action_l2"] = float(metrics["action_l2"])
                             if "action_l1" in metrics:
                                 eval_payload["eval/action_l1"] = float(metrics["action_l1"])
-                            self._wandb_log(eval_payload)
+                            self._log_metrics(eval_payload)
 
                     if self.save_every > 0 and self.global_step % self.save_every == 0:
                         ckpt_info = self.save_checkpoint()

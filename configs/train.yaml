@@ -58,9 +58,14 @@ max_grad_norm: 1.0
 weight_decay: 0.0
 resume: null
 
+# tensorboard
+tensorboard:
+  enabled: true
+  log_dir: null
+
 # wandb
 wandb:
-  enabled: true
+  enabled: false
   workspace: arisilin
   project: imagewam
   name: train
