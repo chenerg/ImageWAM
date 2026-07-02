@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader
 
 from .utils.fs import ensure_dir
 from .utils.logging_config import get_logger, setup_logging
+from .utils.accelerator_device import synchronize_device
 from .utils.pytorch_utils import set_global_seed
 from .utils.samplers import ResumableEpochSampler
 from .utils.video_io import save_mp4
@@ -210,7 +211,7 @@ class Wan22Trainer:
             shuffle=False,
             sampler=self.train_sampler,
             num_workers=self.num_workers,
-            pin_memory=torch.cuda.is_available(),
+            pin_memory=self.accelerator.device.type == "cuda",
             worker_init_fn=worker_init_fn,
         )
         if self.num_workers > 0:
@@ -316,8 +317,8 @@ class Wan22Trainer:
     def _rank_timer_sync(self, enabled: bool):
         if not enabled or not self.rank_timer_sync_cuda:
             return
-        if self.accelerator.device.type == "cuda":
-            torch.cuda.synchronize(self.accelerator.device)
+        if self.accelerator.device.type in {"cuda", "npu"}:
+            synchronize_device(self.accelerator.device)
 
     def _gather_rank_timer_stats(self, timings: dict[str, float], device: torch.device):
         names = ("data", "forward", "backward", "optimizer", "metrics", "total")

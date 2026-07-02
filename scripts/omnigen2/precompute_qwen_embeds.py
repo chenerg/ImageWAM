@@ -39,6 +39,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, Qwen2_5_VLModel
 
 from imagewam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
+from imagewam.utils.accelerator_device import resolve_train_device, set_accelerator_device
 from imagewam.utils.config_resolvers import register_default_resolvers
 from imagewam.utils.logging_config import get_logger, setup_logging
 
@@ -187,19 +188,13 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------
     # GPU / device assignment
     # ------------------------------------------------------------------
-    if torch.cuda.is_available():
-        num_gpus = torch.cuda.device_count()
-        gpu_id = local_rank % num_gpus
-        device = torch.device(f"cuda:{gpu_id}")
-        torch.cuda.set_device(device)
-    else:
-        device = torch.device("cpu")
-        gpu_id = -1
-    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    device = torch.device(resolve_train_device())
+    set_accelerator_device(device)
+    dtype = torch.bfloat16 if device.type in {"cuda", "npu"} else torch.float32
 
     if is_main:
         logger.info(
-            "Multi-GPU cache: world_size=%d  local_rank=%d → device=%s  dtype=%s",
+            "Multi-device cache: world_size=%d  local_rank=%d → device=%s  dtype=%s",
             world_size, local_rank, device, dtype,
         )
 

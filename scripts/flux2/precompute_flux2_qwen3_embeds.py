@@ -35,6 +35,7 @@ if str(REPO_ROOT / "src") not in sys.path:
 
 from imagewam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from imagewam.models.backbones.flux2_imports import ensure_flux2_importable
+from imagewam.utils.accelerator_device import resolve_train_device, set_accelerator_device
 from imagewam.utils.config_resolvers import register_default_resolvers
 from imagewam.utils.logging_config import get_logger, setup_logging
 
@@ -179,9 +180,8 @@ def main(cfg: DictConfig) -> None:
         raise ValueError("`cfg.model` is required.")
 
     local_rank, world_size = _get_rank_info()
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    if device.type == "cuda":
-        torch.cuda.set_device(device)
+    device = torch.device(resolve_train_device())
+    set_accelerator_device(device)
     is_main = local_rank == 0
 
     dataset_dirs, cache_dirs, context_lens, config_prompts = _collect_dataset_settings(cfg.data)
@@ -209,7 +209,7 @@ def main(cfg: DictConfig) -> None:
     if is_main:
         logger.info("Caching FLUX.2 Qwen3 embeddings with %s, prompts=%d, len=%d", model_spec, len(prompts), context_len)
     tokenizer = AutoTokenizer.from_pretrained(model_spec)
-    model_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    model_dtype = torch.bfloat16 if device.type in {"cuda", "npu"} else torch.float32
     model = AutoModelForCausalLM.from_pretrained(model_spec, torch_dtype=model_dtype).to(device).eval()
 
     batch_size = int(cfg.get("qwen_cache_batch_size", 16))

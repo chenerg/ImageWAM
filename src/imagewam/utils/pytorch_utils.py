@@ -7,6 +7,8 @@ import torch
 import torch.distributed as dist
 import numpy as np
 
+from .accelerator_device import manual_seed_all_accelerators
+
 
 def _resolve_global_rank() -> int:
     if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -28,8 +30,7 @@ def set_global_seed(seed: int, get_worker_init_fn: bool = False) -> Optional[Cal
     random.seed(process_seed)
     np.random.seed(process_seed)
     torch.manual_seed(process_seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(process_seed)
+    manual_seed_all_accelerators(process_seed)
 
     return worker_init_function if get_worker_init_fn else None
 
