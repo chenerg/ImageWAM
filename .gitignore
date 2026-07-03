@@ -1,6 +1,7 @@
 terminal_outliers/*
 vis_results/*
 extracted_episodes/*
+third_party/lerobot/
 # Misc
 
 outputs/
