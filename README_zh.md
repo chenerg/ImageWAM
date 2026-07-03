@@ -218,6 +218,41 @@ bash scripts/data/precompute_noops_lerobot.sh
 
 默认会读取 `configs/data/robotwin_omnigen2.yaml` 里的 `robotwin_root`，并写入其中的 `nonidle_filter_path`。
 
+如果需要生成一个已经物理删除 idle 帧的新 LeRobot v3 数据集目录，同时裁剪 parquet data 和 videos，可以运行：
+
+```bash
+python scripts/data/materialize_lerobot_v3_nonidle.py \
+  data/robotwin2.0/robotwin2.0 \
+  data/robotwin2.0/robotwin2.0_nonidle \
+  --video-backend pyav
+```
+
+该命令会创建新的输出数据集，不会修改输入数据集。输出数据集中的 `episode_index`、`frame_index`、`timestamp` 和全局 `index` 会从 0 重新连续编号。脚本会显示 range 计算和保留帧写入进度，并在输出目录写入汇总报告：
+
+```text
+data/robotwin2.0/robotwin2.0_nonidle/nonidle_materialize_report.json
+```
+
+常用参数：
+
+```bash
+# 覆盖已存在的输出目录。
+--overwrite
+
+# 只处理前 N 个 episode，适合先做快速测试。
+--max-episodes N
+
+# 在纯日志环境里关闭进度条。
+--no-progress
+
+# 调整 idle 检测阈值。
+--idle-l2-threshold 1e-3
+--idle-arm-l2-threshold 1e-3
+--idle-gripper-l2-threshold 1e-3
+--min-idle-len 5
+--min-non-idle-len 1
+```
+
 ## Benchmark 环境
 
 ### LIBERO / LIBERO-plus

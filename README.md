@@ -219,6 +219,41 @@ bash scripts/data/precompute_noops_lerobot.sh
 
 By default, this reads `robotwin_root` and writes to `nonidle_filter_path` from `configs/data/robotwin_omnigen2.yaml`.
 
+If you need a new LeRobot v3 dataset directory with idle frames physically removed from both parquet data and videos, run:
+
+```bash
+python scripts/data/materialize_lerobot_v3_nonidle.py \
+  data/robotwin2.0/robotwin2.0 \
+  data/robotwin2.0/robotwin2.0_nonidle \
+  --video-backend pyav
+```
+
+This command creates a fresh output dataset and leaves the input dataset unchanged. Episode indices, frame indices, timestamps, and global frame indices are rebuilt from zero in the output dataset. The script prints progress for range computation and kept-frame writing, and writes a summary to:
+
+```text
+data/robotwin2.0/robotwin2.0_nonidle/nonidle_materialize_report.json
+```
+
+Useful options:
+
+```bash
+# Replace an existing output directory.
+--overwrite
+
+# Process only the first N episodes for a quick smoke test.
+--max-episodes N
+
+# Disable progress bars in log-only environments.
+--no-progress
+
+# Tune idle detection thresholds.
+--idle-l2-threshold 1e-3
+--idle-arm-l2-threshold 1e-3
+--idle-gripper-l2-threshold 1e-3
+--min-idle-len 5
+--min-non-idle-len 1
+```
+
 ## Benchmark Environments
 
 ### LIBERO / LIBERO-plus
