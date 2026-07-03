@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import inspect
 import json
 import shutil
 from dataclasses import dataclass
@@ -297,13 +298,15 @@ def _load_lerobot_dataset(dataset_dir: Path, video_backend: str | None) -> Any:
             "with LeRobot v3 dataset support."
         ) from exc
 
-    return LeRobotDataset(
-        repo_id=dataset_dir.name,
-        root=dataset_dir,
-        download_videos=True,
-        video_backend=video_backend,
-        return_uint8=True,
-    )
+    kwargs = {
+        "repo_id": dataset_dir.name,
+        "root": dataset_dir,
+        "download_videos": True,
+        "video_backend": video_backend,
+    }
+    if "return_uint8" in inspect.signature(LeRobotDataset).parameters:
+        kwargs["return_uint8"] = True
+    return LeRobotDataset(**kwargs)
 
 
 def _create_output_dataset(

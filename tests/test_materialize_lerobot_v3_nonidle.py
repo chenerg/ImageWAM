@@ -76,14 +76,12 @@ class _FakeLeRobotDataset:
         root,
         download_videos=True,
         video_backend=None,
-        return_uint8=False,
         **_,
     ):
         self.repo_id = repo_id
         self.root = Path(root)
         self.download_videos = download_videos
         self.video_backend = video_backend
-        self.return_uint8 = return_uint8
         cfg = self.registry[str(self.root)]
         self.rows = list(cfg["rows"])
         self.meta = _FakeMeta(cfg["episodes"], cfg["features"])
