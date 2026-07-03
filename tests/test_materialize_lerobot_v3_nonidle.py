@@ -199,6 +199,7 @@ class MaterializeLeRobotV3NonidleTest(unittest.TestCase):
             ),
             video_backend="pyav",
             parallel_encoding=False,
+            show_progress=False,
         )
 
         output = _FakeOutputDataset.instances[0]
@@ -230,6 +231,7 @@ class MaterializeLeRobotV3NonidleTest(unittest.TestCase):
                 output_root,
                 thresholds=thresholds,
                 parallel_encoding=False,
+                show_progress=False,
             )
 
         report = materialize.materialize_nonidle_dataset(
@@ -238,6 +240,7 @@ class MaterializeLeRobotV3NonidleTest(unittest.TestCase):
             thresholds=thresholds,
             overwrite=True,
             parallel_encoding=False,
+            show_progress=False,
         )
         self.assertFalse((output_root / "old.txt").exists())
         self.assertEqual(report["summary"]["kept_frames"], 6)

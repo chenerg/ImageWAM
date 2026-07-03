@@ -51,6 +51,39 @@ class EpisodePlan:
         return sum(end - start for start, end in self.keep_ranges)
 
 
+def _get_tqdm() -> Any | None:
+    try:
+        from tqdm.auto import tqdm
+    except ImportError:
+        return None
+    return tqdm
+
+
+def _iter_progress(
+    iterable: Any,
+    *,
+    enabled: bool,
+    desc: str,
+    unit: str,
+    total: int | None = None,
+    leave: bool = True,
+) -> Any:
+    tqdm = _get_tqdm() if enabled else None
+    if tqdm is None:
+        return iterable
+    return tqdm(iterable, total=total, desc=desc, unit=unit, leave=leave)
+
+
+def _progress_message(message: str, *, enabled: bool) -> None:
+    if not enabled:
+        return
+    tqdm = _get_tqdm() if enabled else None
+    if tqdm is None:
+        print(message, flush=True)
+        return
+    tqdm.write(message)
+
+
 def _to_scalar(value: Any) -> Any:
     if hasattr(value, "item"):
         return value.item()
@@ -176,13 +209,21 @@ def compute_episode_plans(
     thresholds: IdleThresholds,
     *,
     max_episodes: int | None = None,
+    show_progress: bool = True,
 ) -> list[EpisodePlan]:
     plans: list[EpisodePlan] = []
     rows = _iter_episode_rows(dataset.meta.episodes)
     if max_episodes is not None:
         rows = rows[:max_episodes]
 
-    for episode_pos, row in enumerate(rows):
+    episode_iter = _iter_progress(
+        enumerate(rows),
+        enabled=show_progress,
+        desc="Computing non-idle ranges",
+        unit="episode",
+        total=len(rows),
+    )
+    for episode_pos, row in episode_iter:
         episode_index = int(_to_scalar(row.get("episode_index", episode_pos)))
         start = int(_to_scalar(row["dataset_from_index"]))
         end = int(_to_scalar(row["dataset_to_index"]))
@@ -315,12 +356,18 @@ def materialize_nonidle_dataset(
     max_episodes: int | None = None,
     repo_id: str | None = None,
     parallel_encoding: bool = True,
+    show_progress: bool = True,
 ) -> dict[str, Any]:
     input_dir = input_dir.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
 
     source_dataset = _load_lerobot_dataset(input_dir, video_backend)
-    plans = compute_episode_plans(source_dataset, thresholds, max_episodes=max_episodes)
+    plans = compute_episode_plans(
+        source_dataset,
+        thresholds,
+        max_episodes=max_episodes,
+        show_progress=show_progress,
+    )
 
     total_frames = sum(plan.source_length for plan in plans)
     kept_frames = sum(plan.kept_frames for plan in plans)
@@ -336,28 +383,37 @@ def materialize_nonidle_dataset(
     )
 
     output_episode_index = 0
+    frame_progress = _iter_progress(
+        range(kept_frames),
+        enabled=show_progress,
+        desc="Writing kept frames",
+        unit="frame",
+        total=kept_frames,
+    )
+    frame_progress_iter = iter(frame_progress)
     try:
         for count, plan in enumerate(plans, start=1):
             if plan.kept_frames == 0:
-                print(
+                _progress_message(
                     f"skipping source episode {plan.source_episode_index}: no kept frames",
-                    flush=True,
+                    enabled=show_progress,
                 )
                 continue
             plan.output_episode_index = output_episode_index
             for source_idx in _expanded_source_indices(plan):
+                next(frame_progress_iter)
                 source_item = source_dataset[source_idx]
                 output_dataset.add_frame(_frame_for_writer(source_item, source_dataset.meta.features))
             output_dataset.save_episode(parallel_encoding=parallel_encoding)
-            print(
+            _progress_message(
                 f"wrote episode {output_episode_index} from source episode "
                 f"{plan.source_episode_index}: kept {plan.kept_frames}/{plan.source_length} frames",
-                flush=True,
+                enabled=show_progress,
             )
             output_episode_index += 1
-            if count % 100 == 0:
-                print(f"processed {count}/{len(plans)} source episodes...", flush=True)
     finally:
+        if hasattr(frame_progress, "close"):
+            frame_progress.close()
         output_dataset.finalize()
 
     report = {
@@ -418,6 +474,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-episodes", type=int, default=None)
     parser.add_argument("--repo-id", default=None, help="Repo id stored in output metadata.")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
     parser.add_argument(
         "--no-parallel-encoding",
         action="store_true",
@@ -444,6 +501,7 @@ def main() -> None:
         max_episodes=args.max_episodes,
         repo_id=args.repo_id,
         parallel_encoding=not args.no_parallel_encoding,
+        show_progress=not args.no_progress,
     )
 
 
