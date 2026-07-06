@@ -12,6 +12,12 @@ Example:
 """
 from __future__ import annotations
 
+try:
+    import torch_npu
+    from torch_npu.contrib import transfer_to_npu
+except ImportError:
+    pass
+
 import concurrent.futures
 import hashlib
 import json
