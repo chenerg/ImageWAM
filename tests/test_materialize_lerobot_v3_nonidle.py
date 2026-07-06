@@ -30,6 +30,14 @@ class _FakeMeta:
         self.video_files_size_in_mb = 100
 
 
+class _FakeOutputMeta:
+    def __init__(self):
+        self.chunk_settings = None
+
+    def update_chunk_settings(self, **kwargs):
+        self.chunk_settings = kwargs
+
+
 class _FakeOutputDataset:
     instances = []
 
@@ -42,6 +50,7 @@ class _FakeOutputDataset:
         self.robot_type = robot_type
         self.use_videos = use_videos
         self.video_backend = video_backend
+        self.meta = _FakeOutputMeta()
         self.current = []
         self.episodes = []
         self.finalized = False
@@ -84,6 +93,7 @@ class _FakeLeRobotDataset:
         self.video_backend = video_backend
         cfg = self.registry[str(self.root)]
         self.rows = list(cfg["rows"])
+        self.hf_dataset = _FakeHfDataset(self.rows)
         self.meta = _FakeMeta(cfg["episodes"], cfg["features"])
 
     @classmethod
@@ -96,7 +106,6 @@ class _FakeLeRobotDataset:
         robot_type=None,
         use_videos=True,
         video_backend=None,
-        **_,
     ):
         return _FakeOutputDataset(root, repo_id, features, fps, robot_type, use_videos, video_backend)
 
@@ -106,6 +115,14 @@ class _FakeLeRobotDataset:
         return row
 
     def get_raw_item(self, idx):
+        return dict(self.rows[idx])
+
+
+class _FakeHfDataset:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def __getitem__(self, idx):
         return dict(self.rows[idx])
 
 
@@ -202,6 +219,14 @@ class MaterializeLeRobotV3NonidleTest(unittest.TestCase):
 
         output = _FakeOutputDataset.instances[0]
         self.assertTrue(output.finalized)
+        self.assertEqual(
+            output.meta.chunk_settings,
+            {
+                "chunks_size": 1000,
+                "data_files_size_in_mb": 100,
+                "video_files_size_in_mb": 100,
+            },
+        )
         self.assertEqual(len(output.episodes), 2)
         self.assertEqual([len(ep) for ep in output.episodes], [4, 2])
         self.assertEqual([row["frame_index"] for row in output.episodes[0]], [0, 1, 2, 3])
@@ -242,6 +267,17 @@ class MaterializeLeRobotV3NonidleTest(unittest.TestCase):
         )
         self.assertFalse((output_root / "old.txt").exists())
         self.assertEqual(report["summary"]["kept_frames"], 6)
+
+    def test_action_state_filtering_uses_hf_dataset_when_get_raw_item_is_absent(self):
+        input_root = self.tmp_path / "input"
+        _register_fake_dataset(input_root)
+        dataset = _FakeLeRobotDataset(repo_id="input", root=input_root)
+
+        with patch.object(_FakeLeRobotDataset, "get_raw_item", None):
+            action, state = materialize._load_action_state_for_episode(dataset, 0, 3)
+
+        np.testing.assert_array_equal(action[:, 0], np.array([1.0, 0.0, 0.0]))
+        np.testing.assert_array_equal(state[:, 0], np.array([0.0, 0.0, 0.0]))
 
 
 if __name__ == "__main__":

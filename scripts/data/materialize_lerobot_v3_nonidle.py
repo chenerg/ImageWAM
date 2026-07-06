@@ -119,6 +119,26 @@ def _column_values_to_numpy(values: list[Any]) -> np.ndarray:
     return arr
 
 
+def _filter_supported_kwargs(callable_obj: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    signature = inspect.signature(callable_obj)
+    parameters = signature.parameters
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+        return dict(kwargs)
+    return {key: value for key, value in kwargs.items() if key in parameters}
+
+
+def _raw_item_for_filtering(dataset: Any, idx: int) -> dict[str, Any]:
+    raw_getter = getattr(dataset, "get_raw_item", None)
+    if callable(raw_getter):
+        return dict(raw_getter(idx))
+
+    hf_dataset = getattr(dataset, "hf_dataset", None)
+    if hf_dataset is not None:
+        return dict(hf_dataset[idx])
+
+    return dict(dataset[idx])
+
+
 def _split_arm_gripper(delta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if delta.shape[1] >= 14:
         arm = np.concatenate([delta[:, :6], delta[:, 7:13]], axis=1)
@@ -192,7 +212,7 @@ def _iter_episode_rows(episodes: Any) -> list[dict[str, Any]]:
 
 
 def _load_action_state_for_episode(dataset: Any, start: int, end: int) -> tuple[np.ndarray, np.ndarray]:
-    raw_items = [dataset.get_raw_item(idx) for idx in range(start, end)]
+    raw_items = [_raw_item_for_filtering(dataset, idx) for idx in range(start, end)]
     if not raw_items:
         raise ValueError(f"Episode range is empty: [{start}, {end})")
     names = list(raw_items[0])
@@ -333,12 +353,23 @@ def _create_output_dataset(
         if hasattr(meta, attr):
             kwargs[attr] = getattr(meta, attr)
 
-    try:
-        return LeRobotDataset.create(**kwargs)
-    except TypeError:
-        for attr in ("chunks_size", "data_files_size_in_mb", "video_files_size_in_mb"):
-            kwargs.pop(attr, None)
-        return LeRobotDataset.create(**kwargs)
+    supported_kwargs = _filter_supported_kwargs(LeRobotDataset.create, kwargs)
+    output_dataset = LeRobotDataset.create(**supported_kwargs)
+
+    deferred_chunk_settings = {
+        key: kwargs[key]
+        for key in ("chunks_size", "data_files_size_in_mb", "video_files_size_in_mb")
+        if key in kwargs and key not in supported_kwargs
+    }
+    if deferred_chunk_settings:
+        chunk_settings_target = output_dataset
+        if not hasattr(chunk_settings_target, "update_chunk_settings"):
+            chunk_settings_target = getattr(output_dataset, "meta", None)
+        update_chunk_settings = getattr(chunk_settings_target, "update_chunk_settings", None)
+        if callable(update_chunk_settings):
+            update_chunk_settings(**deferred_chunk_settings)
+
+    return output_dataset
 
 
 def _prepare_output_dir(output_dir: Path, overwrite: bool) -> None:
