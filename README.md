@@ -211,15 +211,23 @@ qwen_cache_dir: ${data.robotwin_root}/qwen_cache
 nonidle_filter_path: ${data.robotwin_root}/nonidle_ranges.json
 ```
 
-To filter no-op frames in RoboTwin, we use a precomputed JSON file. It can be generated with:
+To filter no-op frames in RoboTwin, the default workflow is to generate a non-idle JSON file and let the dataloader apply it at training time. This does not rewrite parquet files or videos, so it is much faster than creating a new dataset directory.
 
 ```bash
-bash scripts/data/precompute_noops_lerobot.sh
+python scripts/data/compute_robotwin_v3_nonidle_ranges.py \
+  data/robotwin2.0/robotwin2.0 \
+  --output data/robotwin2.0/robotwin2.0/nonidle_ranges.json
 ```
 
-By default, this reads `robotwin_root` and writes to `nonidle_filter_path` from `configs/data/robotwin_omnigen2.yaml`.
+The default RoboTwin configs read this file through `nonidle_filter_path`, so training can keep using the original dataset root:
 
-If you need a new LeRobot v3 dataset directory with idle frames physically removed from both parquet data and videos, run:
+```yaml
+nonidle_filter_path: ${data.robotwin_root}/nonidle_ranges.json
+```
+
+If you use the older per-episode LeRobot layout, run `scripts/data/compute_robotwin_nonidle_ranges.py` instead. The v3 script above is for the chunk/file layout used by LeRobot v3.
+
+Only if you specifically need a new LeRobot v3 dataset directory with idle frames physically removed from both parquet data and videos, run:
 
 ```bash
 python scripts/data/materialize_lerobot_v3_nonidle.py \
@@ -228,7 +236,7 @@ python scripts/data/materialize_lerobot_v3_nonidle.py \
   --video-backend pyav
 ```
 
-This command creates a fresh output dataset and leaves the input dataset unchanged. Episode indices, frame indices, timestamps, and global frame indices are rebuilt from zero in the output dataset. The script prints progress for range computation and kept-frame writing, and writes a summary to:
+This command is optional and much slower because it writes a fresh output dataset and re-encodes videos. It leaves the input dataset unchanged. Episode indices, frame indices, timestamps, and global frame indices are rebuilt from zero in the output dataset. The script prints progress for range computation and kept-frame writing, and writes a summary to:
 
 ```text
 data/robotwin2.0/robotwin2.0_nonidle/nonidle_materialize_report.json

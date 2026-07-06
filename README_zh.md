@@ -210,15 +210,23 @@ qwen_cache_dir: ${data.robotwin_root}/qwen_cache
 nonidle_filter_path: ${data.robotwin_root}/nonidle_ranges.json
 ```
 
-为了过滤 RoboTwin中的no-ops帧，我们使用了预先计算的过滤json，这可以通过如下json得到。
+为了过滤 RoboTwin 中的 no-op 帧，默认流程是先生成 non-idle JSON，然后在训练时由 dataloader 根据 `nonidle_filter_path` 过滤采样。这个方式不会重写 parquet 或视频文件，比创建新的数据集目录快很多。
 
 ```bash
-bash scripts/data/precompute_noops_lerobot.sh
+python scripts/data/compute_robotwin_v3_nonidle_ranges.py \
+  data/robotwin2.0/robotwin2.0 \
+  --output data/robotwin2.0/robotwin2.0/nonidle_ranges.json
 ```
 
-默认会读取 `configs/data/robotwin_omnigen2.yaml` 里的 `robotwin_root`，并写入其中的 `nonidle_filter_path`。
+默认 RoboTwin 配置会通过 `nonidle_filter_path` 读取这个文件，因此训练时仍然使用原始数据集目录：
 
-如果需要生成一个已经物理删除 idle 帧的新 LeRobot v3 数据集目录，同时裁剪 parquet data 和 videos，可以运行：
+```yaml
+nonidle_filter_path: ${data.robotwin_root}/nonidle_ranges.json
+```
+
+如果使用的是旧的按 episode 存储的 LeRobot 布局，请改用 `scripts/data/compute_robotwin_nonidle_ranges.py`。上面的 v3 脚本适用于 LeRobot v3 的 chunk/file 布局。
+
+只有在确实需要一个已经物理删除 idle 帧的新 LeRobot v3 数据集目录，并同时裁剪 parquet data 和 videos 时，才需要运行：
 
 ```bash
 python scripts/data/materialize_lerobot_v3_nonidle.py \
@@ -227,7 +235,7 @@ python scripts/data/materialize_lerobot_v3_nonidle.py \
   --video-backend pyav
 ```
 
-该命令会创建新的输出数据集，不会修改输入数据集。输出数据集中的 `episode_index`、`frame_index`、`timestamp` 和全局 `index` 会从 0 重新连续编号。脚本会显示 range 计算和保留帧写入进度，并在输出目录写入汇总报告：
+这个命令是可选方案，并且会慢很多，因为它会写出新的数据集并重新编码视频。它不会修改输入数据集。输出数据集中的 `episode_index`、`frame_index`、`timestamp` 和全局 `index` 会从 0 重新连续编号。脚本会显示 range 计算和保留帧写入进度，并在输出目录写入汇总报告：
 
 ```text
 data/robotwin2.0/robotwin2.0_nonidle/nonidle_materialize_report.json
