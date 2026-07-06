@@ -9,7 +9,7 @@
 - 本地 LeRobot v2 实现：`src/imagewam/datasets/lerobot/lerobot/lerobot_dataset.py`
 - 外部 LeRobot v3 适配层：`src/imagewam/datasets/lerobot/lerobot/lerobot_dataset_v3.py`
 - RoboTwin non-idle JSON 预计算：`scripts/data/compute_robotwin_nonidle_ranges.py`
-- FLUX.2 4B + RoboTwin v3 专用训练入口：`scripts/flux2/run_train_flux2_4b_robotwin_v3.sh`
+- FLUX.2 Klein + RoboTwin v3 训练入口：`scripts/flux2/run_train_flux2_klein_imagewam.sh`，设置 `TASK_TYPE=robotwin_v3`
 
 ## 1. 背景
 
@@ -467,40 +467,43 @@ v3 的普通路径把这些上下文窗口细节封装在外部 LeRobot v3 datas
 
 代价是：strict 模式下 query 帧是逐帧读取再 stack，不像 v2 那样可以对非视频字段直接 `hf_dataset.select(q_idx)` 批量读取。因此 v3 strict non-idle 的行为更正确，但性能特征会更依赖外部 v3 dataset 的单帧读取效率和视频 seek 成本。
 
-## 10. RoboTwin v3 + FLUX.2 4B 训练入口
+## 10. RoboTwin v3 + FLUX.2 Klein 训练入口
 
-专用脚本：
+RoboTwin v3 不再使用单独的专用脚本，而是通过通用 FLUX.2 Klein 入口指定 `TASK_TYPE=robotwin_v3`：
 
 ```bash
-bash scripts/flux2/run_train_flux2_4b_robotwin_v3.sh
+TASK_TYPE=robotwin_v3 FLUX2_VARIANT=4b \
+bash scripts/flux2/run_train_flux2_klein_imagewam.sh
 ```
 
-脚本默认设置：
+这个入口会生成对应的 task 名：
 
 ```bash
-export DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data/robotwin2.0}"
-export ROBOTWIN_ROOT="${ROBOTWIN_ROOT:-${DATA_ROOT}/robotwin2.0}"
-export NONIDLE_FILTER_PATH="${NONIDLE_FILTER_PATH:-${ROBOTWIN_ROOT}/nonidle_ranges.json}"
-export TASK_TYPE="robotwin"
-export FLUX2_VARIANT="4b"
+# FLUX2_VARIANT=4b
+robotwin_v3_flux2_klein_4b_base_imagewam
+
+# FLUX2_VARIANT=9b
+robotwin_v3_flux2_klein_9b_base_imagewam
 ```
 
-并传入关键 Hydra override：
+这些 task 配置会使用 `configs/data/robotwin_v3_omnigen2.yaml`，关键默认值包括：
 
 ```bash
-data=robotwin_v3_omnigen2
-data.train.dataset_dirs=[${ROBOTWIN_ROOT}]
-data.val.dataset_dirs=[${ROBOTWIN_ROOT}]
-data.train.nonidle_filter_path=${NONIDLE_FILTER_PATH}
-data.val.nonidle_filter_path=${NONIDLE_FILTER_PATH}
+data.data_root=./data/robotwin2.0_v3
+data.robotwin_root=${data.data_root}/robotwin2.0_v3
+data.train.lerobot_backend=v3
+data.train.lerobot_v3_index_cache=./dataset_meta/robotwin_v3_omnigen2_train_lerobot_v3_index.json
+data.val.lerobot_v3_index_cache=./dataset_meta/robotwin_v3_omnigen2_val_lerobot_v3_index.json
 ```
 
-如果数据集或 filter JSON 不在默认位置，可以覆盖：
+如果数据集或 filter JSON 不在默认位置，可以直接传 Hydra override：
 
 ```bash
-ROBOTWIN_ROOT=/path/to/robotwin2.0 \
-NONIDLE_FILTER_PATH=/path/to/nonidle_ranges.json \
-bash scripts/flux2/run_train_flux2_4b_robotwin_v3.sh
+TASK_TYPE=robotwin_v3 FLUX2_VARIANT=4b \
+bash scripts/flux2/run_train_flux2_klein_imagewam.sh \
+  data.data_root=/path/to/data_root \
+  data.robotwin_root=/path/to/robotwin2.0_v3 \
+  data.nonidle_filter_path=/path/to/nonidle_ranges.json
 ```
 
 ## 11. 实践建议
