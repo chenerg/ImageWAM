@@ -268,6 +268,7 @@ class MultiLeRobotDatasetV3(torch.utils.data.Dataset):
 
         root_iter = list(zip(self.ds_roots, self.ds_names, strict=True))
         init_num_workers = max(1, int(init_num_workers))
+        init_num_workers = min(len(root_iter), int(init_num_workers))
         if init_num_workers == 1:
             entries = [
                 build_entry(dataset_idx, ds_root, ds_name)
