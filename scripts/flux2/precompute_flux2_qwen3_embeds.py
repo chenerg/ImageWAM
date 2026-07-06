@@ -223,6 +223,9 @@ def main(cfg: DictConfig) -> None:
     save_workers = int(cfg.get("qwen_cache_save_workers", 4))
     for cache_dir in cache_dirs:
         cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir_paths = [str(cache_dir.resolve()) for cache_dir in cache_dirs]
+    if is_main:
+        logger.info("Saving FLUX.2 Qwen3 embeddings to: %s", ", ".join(cache_dir_paths))
 
     def _save_one(prompt: str, hidden_i: torch.Tensor, mask_i: torch.Tensor) -> None:
         hashed = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
@@ -292,7 +295,14 @@ def main(cfg: DictConfig) -> None:
                 written += 1
         for fut in concurrent.futures.as_completed(futs):
             fut.result()
-    logger.info("[rank%d] Finished FLUX.2 Qwen3 cache: written=%d skipped=%d gpu_fwd=%.1fs", local_rank, written, skipped, total_fwd_s)
+    logger.info(
+        "[rank%d] Finished FLUX.2 Qwen3 cache: written=%d skipped=%d gpu_fwd=%.1fs saved_to=%s",
+        local_rank,
+        written,
+        skipped,
+        total_fwd_s,
+        ", ".join(cache_dir_paths),
+    )
 
 
 if __name__ == "__main__":
