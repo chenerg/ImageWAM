@@ -488,7 +488,7 @@ export FLUX2_VARIANT="4b"
 并传入关键 Hydra override：
 
 ```bash
-data=robotwin_omnigen2_v3
+data=robotwin_v3_omnigen2
 data.train.dataset_dirs=[${ROBOTWIN_ROOT}]
 data.val.dataset_dirs=[${ROBOTWIN_ROOT}]
 data.train.nonidle_filter_path=${NONIDLE_FILTER_PATH}
