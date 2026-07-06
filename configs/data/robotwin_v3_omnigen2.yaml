@@ -2,6 +2,9 @@ defaults:
   - robotwin_omnigen2
   - _self_
 
+data_root: ./data/robotwin2.0_v3
+robotwin_root: ${data.data_root}/robotwin2.0_v3
+
 train:
   lerobot_backend: v3
   lerobot_v3_init_num_workers: 16
