@@ -12,6 +12,7 @@ import argparse
 import copy
 import inspect
 import json
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -139,6 +140,27 @@ def _raw_item_for_filtering(dataset: Any, idx: int) -> dict[str, Any]:
     return dict(dataset[idx])
 
 
+def _batch_raw_items(dataset: Any, start: int, end: int) -> dict[str, Any]:
+    """Read a contiguous slice of raw (parquet) rows in one shot.
+
+    Falls back to per-frame access if the dataset does not expose a slicable
+    ``hf_dataset``. Video frames are never decoded here — this only reads the
+    scalar/vector columns stored in parquet.
+    """
+    hf_dataset = getattr(dataset, "hf_dataset", None)
+    if hf_dataset is not None:
+        try:
+            rows = dict(hf_dataset[start:end])
+            # HuggingFace returns a dict {column: [values...]}; sanity-check it
+            # actually looks column-major before trusting it.
+            if rows and all(isinstance(v, (list, tuple)) for v in rows.values()):
+                return rows
+        except Exception:
+            pass
+    return {key: [_raw_item_for_filtering(dataset, idx)[key] for idx in range(start, end)]
+            for key in _raw_item_for_filtering(dataset, start)}
+
+
 def _split_arm_gripper(delta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if delta.shape[1] >= 14:
         arm = np.concatenate([delta[:, :6], delta[:, 7:13]], axis=1)
@@ -212,14 +234,14 @@ def _iter_episode_rows(episodes: Any) -> list[dict[str, Any]]:
 
 
 def _load_action_state_for_episode(dataset: Any, start: int, end: int) -> tuple[np.ndarray, np.ndarray]:
-    raw_items = [_raw_item_for_filtering(dataset, idx) for idx in range(start, end)]
-    if not raw_items:
+    if start >= end:
         raise ValueError(f"Episode range is empty: [{start}, {end})")
-    names = list(raw_items[0])
+    rows = _batch_raw_items(dataset, start, end)
+    names = list(rows)
     action_key = _select_column(names, ACTION_CANDIDATES, "action")
     state_key = _select_column(names, STATE_CANDIDATES, "state")
-    action = _column_values_to_numpy([item[action_key] for item in raw_items])
-    state = _column_values_to_numpy([item[state_key] for item in raw_items])
+    action = _column_values_to_numpy(list(rows[action_key]))
+    state = _column_values_to_numpy(list(rows[state_key]))
     if action.shape != state.shape:
         raise ValueError(f"Action/state shape mismatch: action={action.shape}, state={state.shape}")
     return action, state
@@ -302,11 +324,200 @@ def _frame_for_writer(source_item: dict[str, Any], features: dict[str, Any]) -> 
     return frame
 
 
-def _expanded_source_indices(plan: EpisodePlan) -> list[int]:
-    indices: list[int] = []
-    for start, end in plan.keep_ranges:
-        indices.extend(range(plan.source_start + start, plan.source_start + end))
-    return indices
+def _source_video_lookups(
+    source_dataset: Any, episode_index: int
+) -> tuple[list[str], dict[str, Path], dict[str, float]]:
+    """Resolve per-camera video file paths and episode start offsets.
+
+    Mirrors ``LeRobotDataset._query_videos``: each episode's frames are stored
+    sequentially inside a concatenated mp4, so a frame's absolute timestamp in
+    the file is ``from_timestamp + episode_relative_timestamp``.
+    """
+    meta = source_dataset.meta
+    video_keys = list(getattr(meta, "video_keys", []) or [])
+    if not video_keys:
+        return [], {}, {}
+    ep = meta.episodes[episode_index]
+    video_paths: dict[str, Path] = {}
+    from_ts: dict[str, float] = {}
+    for vid_key in video_keys:
+        video_paths[vid_key] = source_dataset.root / meta.get_video_file_path(episode_index, vid_key)
+        from_ts[vid_key] = float(ep[f"videos/{vid_key}/from_timestamp"])
+    return video_keys, video_paths, from_ts
+
+
+def _decode_chunk_for_cameras(
+    video_keys: list[str],
+    video_paths: dict[str, Path],
+    from_ts: dict[str, float],
+    timestamps: list[float],
+    *,
+    tolerance_s: float,
+    video_backend: str | None,
+) -> dict[str, Any]:
+    """Batch-decode one contiguous span of frames for every camera.
+
+    Each camera issues a single ``decode_video_frames`` call with all timestamps
+    at once, so the container is opened once and frames are decoded in a single
+    forward pass instead of once per frame.
+    """
+    from lerobot.datasets.video_utils import decode_video_frames
+
+    decoded: dict[str, Any] = {}
+    for vid_key in video_keys:
+        shifted = [from_ts[vid_key] + float(t) for t in timestamps]
+        decoded[vid_key] = decode_video_frames(
+            video_paths[vid_key], shifted, tolerance_s, video_backend
+        )
+    return decoded
+
+
+def _task_string_at(source_dataset: Any, task_index: int) -> str:
+    tasks = getattr(source_dataset.meta, "tasks", None)
+    if tasks is None:
+        raise KeyError("Source dataset meta has no 'tasks' table to resolve task strings.")
+    row = tasks.iloc[int(task_index)]
+    return getattr(row, "name", None) or str(row.iloc[0])
+
+
+def _prepare_chunk_batch(
+    source_dataset: Any,
+    *,
+    video_keys: list[str],
+    video_paths: dict[str, Path],
+    from_ts: dict[str, float],
+    tolerance_s: float,
+    video_backend: str | None,
+    abs_lo: int,
+    abs_hi: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Fetch everything needed to emit a chunk: parquet rows + decoded video.
+
+    This is the only failure-prone step (video decode). Kept separate from the
+    emit loop so that, on failure, the per-frame fallback can safely re-read the
+    whole chunk without risking double ``add_frame`` calls or progress overshoot.
+    """
+    rows = _batch_raw_items(source_dataset, abs_lo, abs_hi)
+    timestamps = [float(_to_scalar(t)) for t in rows["timestamp"]]
+    decoded = (
+        _decode_chunk_for_cameras(
+            video_keys,
+            video_paths,
+            from_ts,
+            timestamps,
+            tolerance_s=tolerance_s,
+            video_backend=video_backend,
+        )
+        if video_keys
+        else {}
+    )
+    return rows, decoded
+
+
+def _emit_chunk_batch(
+    source_dataset: Any,
+    output_dataset: Any,
+    features: dict[str, Any],
+    rows: dict[str, Any],
+    decoded: dict[str, Any],
+    *,
+    abs_lo: int,
+    abs_hi: int,
+    frame_progress_iter: Any,
+) -> None:
+    """Build per-frame dicts from a prepared chunk and feed them to add_frame."""
+    for i in range(abs_hi - abs_lo):
+        source_item: dict[str, Any] = {}
+        for key in features:
+            if key in DEFAULT_FEATURE_KEYS:
+                continue
+            if key in decoded:
+                source_item[key] = decoded[key][i]
+            elif key in rows:
+                source_item[key] = rows[key][i]
+        task_idx = int(_to_scalar(rows["task_index"][i]))
+        source_item["task"] = _task_string_at(source_dataset, task_idx)
+        next(frame_progress_iter)
+        output_dataset.add_frame(_frame_for_writer(source_item, features))
+
+
+def _write_chunk_per_frame(
+    source_dataset: Any,
+    output_dataset: Any,
+    features: dict[str, Any],
+    *,
+    abs_lo: int,
+    abs_hi: int,
+    frame_progress_iter: Any,
+) -> None:
+    """Fallback: read + write a chunk one frame at a time via ``__getitem__``."""
+    for source_idx in range(abs_lo, abs_hi):
+        next(frame_progress_iter)
+        source_item = source_dataset[source_idx]
+        output_dataset.add_frame(_frame_for_writer(source_item, features))
+
+
+def _materialize_episode(
+    source_dataset: Any,
+    output_dataset: Any,
+    plan: EpisodePlan,
+    features: dict[str, Any],
+    *,
+    decode_chunk_size: int,
+    show_progress: bool,
+    frame_progress_iter: Any,
+) -> None:
+    """Write all kept frames of one source episode, batch-decoding per chunk."""
+    video_keys, video_paths, from_ts = _source_video_lookups(
+        source_dataset, plan.source_episode_index
+    )
+    tolerance_s = float(getattr(source_dataset, "tolerance_s", 1e-4))
+    video_backend = getattr(source_dataset, "video_backend", None)
+    chunk = max(1, int(decode_chunk_size))
+
+    for rng_start, rng_end in plan.keep_ranges:
+        pos = rng_start
+        while pos < rng_end:
+            chunk_end = min(rng_end, pos + chunk)
+            abs_lo = plan.source_start + pos
+            abs_hi = plan.source_start + chunk_end
+            try:
+                rows, decoded = _prepare_chunk_batch(
+                    source_dataset,
+                    video_keys=video_keys,
+                    video_paths=video_paths,
+                    from_ts=from_ts,
+                    tolerance_s=tolerance_s,
+                    video_backend=video_backend,
+                    abs_lo=abs_lo,
+                    abs_hi=abs_hi,
+                )
+            except Exception as exc:  # noqa: BLE001 - fall back to the safe per-frame path
+                _progress_message(
+                    f"batch decode failed for [{abs_lo},{abs_hi}) "
+                    f"({exc!r}); falling back to per-frame read",
+                    enabled=show_progress,
+                )
+                _write_chunk_per_frame(
+                    source_dataset,
+                    output_dataset,
+                    features,
+                    abs_lo=abs_lo,
+                    abs_hi=abs_hi,
+                    frame_progress_iter=frame_progress_iter,
+                )
+            else:
+                _emit_chunk_batch(
+                    source_dataset,
+                    output_dataset,
+                    features,
+                    rows,
+                    decoded,
+                    abs_lo=abs_lo,
+                    abs_hi=abs_hi,
+                    frame_progress_iter=frame_progress_iter,
+                )
+            pos = chunk_end
 
 
 def _load_lerobot_dataset(dataset_dir: Path, video_backend: str | None) -> Any:
@@ -335,6 +546,10 @@ def _create_output_dataset(
     *,
     repo_id: str,
     video_backend: str | None,
+    vcodec: str | None = None,
+    encoder_threads: int | None = None,
+    image_writer_threads: int | None = None,
+    streaming_encoding: bool = False,
 ) -> Any:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -349,6 +564,17 @@ def _create_output_dataset(
         "use_videos": bool(getattr(meta, "video_keys", [])),
         "video_backend": video_backend,
     }
+    # Write-side tuning. These are filtered against LeRobotDataset.create's
+    # signature below, so unsupported keys are dropped silently on older
+    # lerobot versions.
+    if vcodec is not None:
+        kwargs["vcodec"] = vcodec
+    if encoder_threads is not None:
+        kwargs["encoder_threads"] = encoder_threads
+    if image_writer_threads is not None and image_writer_threads > 0:
+        kwargs["image_writer_threads"] = image_writer_threads
+    if streaming_encoding:
+        kwargs["streaming_encoding"] = True
     for attr in ("chunks_size", "data_files_size_in_mb", "video_files_size_in_mb"):
         if hasattr(meta, attr):
             kwargs[attr] = getattr(meta, attr)
@@ -390,10 +616,25 @@ def materialize_nonidle_dataset(
     max_episodes: int | None = None,
     repo_id: str | None = None,
     parallel_encoding: bool = True,
+    vcodec: str | None = None,
+    encoder_threads: int | None = None,
+    image_writer_threads: int | None = None,
+    streaming_encoding: bool = False,
+    decode_chunk_size: int = 256,
     show_progress: bool = True,
 ) -> dict[str, Any]:
     input_dir = input_dir.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
+
+    if streaming_encoding:
+        _progress_message(
+            "WARNING: streaming_encoding is enabled. Under encoder pressure the "
+            "streaming encoder DROPS video frames (see lerobot video_utils.feed_frame), "
+            "which desyncs the output video from its parquet rows. Only use this for "
+            "speed and verify frame counts afterwards, or leave it off for a correct "
+            "materialization.",
+            enabled=show_progress,
+        )
 
     source_dataset = _load_lerobot_dataset(input_dir, video_backend)
     plans = compute_episode_plans(
@@ -414,6 +655,10 @@ def materialize_nonidle_dataset(
         output_dir,
         repo_id=repo_id or f"{input_dir.name}_nonidle",
         video_backend=video_backend,
+        vcodec=vcodec,
+        encoder_threads=encoder_threads,
+        image_writer_threads=image_writer_threads,
+        streaming_encoding=streaming_encoding,
     )
 
     output_episode_index = 0
@@ -434,10 +679,15 @@ def materialize_nonidle_dataset(
                 )
                 continue
             plan.output_episode_index = output_episode_index
-            for source_idx in _expanded_source_indices(plan):
-                next(frame_progress_iter)
-                source_item = source_dataset[source_idx]
-                output_dataset.add_frame(_frame_for_writer(source_item, source_dataset.meta.features))
+            _materialize_episode(
+                source_dataset,
+                output_dataset,
+                plan,
+                source_dataset.meta.features,
+                decode_chunk_size=decode_chunk_size,
+                show_progress=show_progress,
+                frame_progress_iter=frame_progress_iter,
+            )
             output_dataset.save_episode(parallel_encoding=parallel_encoding)
             _progress_message(
                 f"wrote episode {output_episode_index} from source episode "
@@ -514,6 +764,50 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Encode camera videos sequentially when saving each episode.",
     )
+    parser.add_argument(
+        "--decode-chunk-size",
+        type=int,
+        default=256,
+        help=(
+            "Number of kept frames decoded per batched decode_video_frames call. Larger "
+            "reduces per-frame container-open/seek overhead; smaller bounds peak memory. "
+            "Each camera holds chunk*H*W*C*4 bytes (float32) during decode."
+        ),
+    )
+    parser.add_argument(
+        "--vcodec",
+        default="h264",
+        help=(
+            "Output video codec (passed to LeRobotDataset.create). Default 'h264' (libx264) "
+            "is much faster to encode than lerobot's 'libsvtav1' default. Use 'auto' for a "
+            "hardware encoder when available, or 'libsvtav1' for smallest files."
+        ),
+    )
+    parser.add_argument(
+        "--encoder-threads",
+        type=int,
+        default=None,
+        help="Threads per camera encoder process. None lets ffmpeg decide.",
+    )
+    parser.add_argument(
+        "--image-writer-threads",
+        type=int,
+        default=None,
+        help=(
+            "Background threads for writing the per-frame temp PNGs that the non-streaming "
+            "encoder reads back. Drop-free (blocks on backpressure). Defaults to "
+            "max(1, cpu//2) when supported by the lerobot version."
+        ),
+    )
+    parser.add_argument(
+        "--streaming-encoding",
+        action="store_true",
+        help=(
+            "Encode output videos as frames are added (overlaps encode with decode). WARNING: "
+            "the streaming encoder DROPS frames when its queue fills, which desyncs video from "
+            "parquet. Off by default; only enable for speed and verify frame counts afterwards."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -526,6 +820,9 @@ def main() -> None:
         min_idle_len=args.min_idle_len,
         min_non_idle_len=args.min_non_idle_len,
     )
+    image_writer_threads = args.image_writer_threads
+    if image_writer_threads is None:
+        image_writer_threads = max(1, (os.cpu_count() or 2) // 2)
     materialize_nonidle_dataset(
         args.input_dir,
         args.output_dir,
@@ -535,6 +832,11 @@ def main() -> None:
         max_episodes=args.max_episodes,
         repo_id=args.repo_id,
         parallel_encoding=not args.no_parallel_encoding,
+        vcodec=args.vcodec,
+        encoder_threads=args.encoder_threads,
+        image_writer_threads=image_writer_threads,
+        streaming_encoding=args.streaming_encoding,
+        decode_chunk_size=args.decode_chunk_size,
         show_progress=not args.no_progress,
     )
 
