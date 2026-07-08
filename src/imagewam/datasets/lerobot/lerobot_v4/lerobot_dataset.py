@@ -20,6 +20,7 @@ import logging
 import shutil
 import tempfile
 import warnings
+from bisect import bisect_right
 from collections.abc import Callable
 from pathlib import Path
 
@@ -84,6 +85,30 @@ from .datasets.video_utils import (
 from ..constants import HF_LEROBOT_HOME
 
 CODEBASE_VERSION = "v3.0"
+
+
+class _AbsoluteToRelativeIndex:
+    """Map absolute frame indices to loaded HF Dataset rows using episode ranges."""
+
+    def __init__(self, ranges: list[tuple[int, int, int]]):
+        self._ranges = ranges
+        self._starts = [start for start, _, _ in ranges]
+
+    def __getitem__(self, abs_idx: int) -> int:
+        abs_idx = int(abs_idx)
+        range_idx = bisect_right(self._starts, abs_idx) - 1
+        if range_idx < 0:
+            raise KeyError(abs_idx)
+        start, end, rel_start = self._ranges[range_idx]
+        if abs_idx >= end:
+            raise KeyError(abs_idx)
+        return rel_start + (abs_idx - start)
+
+    def get(self, abs_idx: int, default=None):
+        try:
+            return self[abs_idx]
+        except KeyError:
+            return default
 
 
 class LeRobotDatasetMetadata:
@@ -912,10 +937,71 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if self.episodes is None and self.nonidle_filter_path is None:
             self._absolute_to_relative_idx = None
             return
+
+        metadata_index = self._build_absolute_to_relative_idx_from_metadata()
+        if metadata_index is not None and self._metadata_index_matches_loaded_rows(metadata_index):
+            self._absolute_to_relative_idx = metadata_index
+            return
+
+        logging.warning(
+            "Falling back to scanning hf_dataset['index'] to build absolute-to-relative index; "
+            "metadata ranges did not match loaded rows."
+        )
         self._absolute_to_relative_idx = {
             int(abs_idx.item() if isinstance(abs_idx, torch.Tensor) else abs_idx): rel_idx
             for rel_idx, abs_idx in enumerate(self.hf_dataset["index"])
         }
+
+    def _build_absolute_to_relative_idx_from_metadata(self) -> _AbsoluteToRelativeIndex | None:
+        """Build an absolute-to-relative lookup from episode metadata without reading parquet columns."""
+        try:
+            selected_episodes = self._get_selected_episode_indices()
+            sorted_episodes = sorted(
+                selected_episodes,
+                key=lambda ep_idx: int(self.meta.episodes[int(ep_idx)]["dataset_from_index"]),
+            )
+            ranges: list[tuple[int, int, int]] = []
+            rel_start = 0
+            for ep_idx in sorted_episodes:
+                ep = self.meta.episodes[int(ep_idx)]
+                start = int(ep["dataset_from_index"])
+                end = int(ep["dataset_to_index"])
+                if end <= start:
+                    continue
+                ranges.append((start, end, rel_start))
+                rel_start += end - start
+        except Exception:
+            logging.exception("Failed to build absolute-to-relative index from metadata.")
+            return None
+
+        if self.hf_dataset is not None and rel_start != len(self.hf_dataset):
+            logging.warning(
+                "Metadata-derived absolute-to-relative index length mismatch: metadata_frames=%d hf_rows=%d",
+                rel_start,
+                len(self.hf_dataset),
+            )
+            return None
+        return _AbsoluteToRelativeIndex(ranges)
+
+    def _metadata_index_matches_loaded_rows(self, metadata_index: _AbsoluteToRelativeIndex) -> bool:
+        """Sample a few loaded rows to verify metadata order before trusting the fast path."""
+        if self.hf_dataset is None:
+            return False
+        num_rows = len(self.hf_dataset)
+        if num_rows == 0:
+            return True
+        sample_positions = sorted({0, num_rows // 2, num_rows - 1})
+        try:
+            for row_idx in sample_positions:
+                row = self.hf_dataset[row_idx]
+                abs_idx = row["index"]
+                abs_idx = int(abs_idx.item() if isinstance(abs_idx, torch.Tensor) else abs_idx)
+                if metadata_index.get(abs_idx) != row_idx:
+                    return False
+        except Exception:
+            logging.exception("Failed to validate metadata-derived absolute-to-relative index.")
+            return False
+        return True
 
     def _get_selected_episode_indices(self) -> list[int]:
         if self.episodes is not None:
