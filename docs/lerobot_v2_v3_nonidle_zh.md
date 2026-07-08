@@ -7,7 +7,7 @@
 - backend 选择与通用 dataset 包装：`src/imagewam/datasets/lerobot/base_lerobot_dataset.py`
 - RoboTwin 图像/动作样本包装：`src/imagewam/datasets/lerobot/robot_video_dataset.py`
 - 本地 LeRobot v2 实现：`src/imagewam/datasets/lerobot/lerobot/lerobot_dataset.py`
-- 外部 LeRobot v3 适配层：`src/imagewam/datasets/lerobot/lerobot/lerobot_dataset_v3.py`
+- LeRobot v3/v4 本地实现：`src/imagewam/datasets/lerobot/lerobot_v4/lerobot_dataset.py`
 - RoboTwin non-idle JSON 预计算：`scripts/data/compute_robotwin_nonidle_ranges.py`
 - FLUX.2 Klein + RoboTwin v3 训练入口：`scripts/flux2/run_train_flux2_klein_imagewam.sh`，设置 `TASK_TYPE=robotwin_v3`
 
@@ -19,14 +19,14 @@ ImageWAM 的训练 dataset 入口不是直接暴露原始 LeRobot dataset，而�
 RobotVideoDataset
   └── BaseLerobotDataset
         ├── MultiLeRobotDataset    # lerobot_backend="v2"
-        └── MultiLeRobotDatasetV3  # lerobot_backend="v3"
+        └── MultiLeRobotDatasetV3  # lerobot_backend="v3"，当前是 lerobot_v4.MultiLeRobotDataset 的别名
 ```
 
 `RobotVideoDataset` 负责把 LeRobot 样本整理成 ImageWAM 训练需要的格式，例如多相机拼接、图像增强、action/state processor、Qwen 文本缓存读取等。
 
 `BaseLerobotDataset` 负责根据配置生成 `delta_timestamps`、episode split、backend 参数，并实例化 v2 或 v3 的 multi-root dataset。
 
-`MultiLeRobotDataset` 和 `MultiLeRobotDatasetV3` 负责真正访问底层 LeRobot 数据。两者暴露出相似接口，但内部数据访问方式不同。
+`MultiLeRobotDataset` 和 `MultiLeRobotDatasetV3` 负责真正访问底层 LeRobot 数据。当前 `MultiLeRobotDatasetV3` 不再指向旧的外部 v3 adapter，而是直接指向 `lerobot_v4/lerobot_dataset.py` 里的 `MultiLeRobotDataset`。
 
 ## 2. LeRobot v2 backend 实现
 
@@ -65,48 +65,46 @@ v2 自己控制窗口采样逻辑。`__getitem__()` 会：
 
 ## 3. LeRobot v3 backend 实现
 
-v3 backend 是对外部 `lerobot` 包中 `LeRobotDataset` 的兼容适配：
+v3 backend 当前使用仓库内 `lerobot_v4` 实现。代码里保留 `MultiLeRobotDatasetV3` 这个名字作为 backend 兼容入口，但它实际是 `lerobot_v4.MultiLeRobotDataset` 的别名：
 
 ```text
 MultiLeRobotDatasetV3
-  └── external lerobot.datasets.lerobot_dataset.LeRobotDataset
+  └── imagewam.datasets.lerobot.lerobot_v4.lerobot_dataset.MultiLeRobotDataset
+        └── imagewam.datasets.lerobot.lerobot_v4.lerobot_dataset.LeRobotDataset
 ```
 
 ### 3.1 数据加载
 
-v3 不再直接使用本仓库里的 v2 `LeRobotDataset` 读取 parquet。它为每个 root 构造一个外部 LeRobot v3 dataset：
+v3 不再使用旧的 `src/imagewam/datasets/lerobot/lerobot/lerobot_dataset_v3.py` 外部 adapter。`BaseLerobotDataset` 会把 `lerobot_backend="v3"` 映射到 `lerobot_v4.MultiLeRobotDataset`，并为每个 root 构造一个 v4 `LeRobotDataset`：
 
 ```python
-LeRobotDatasetV3(
-    repo_id=ds_name,
+LeRobotDataset(
+    ds_name,
     root=ds_root,
     episodes=selected_episodes,
     image_transforms=image_transforms,
-    delta_timestamps=child_delta_timestamps,
+    delta_timestamps=delta_timestamps,
     tolerance_s=...,
     download_videos=...,
     video_backend=...,
 )
 ```
 
-ImageWAM 的 v3 适配层主要补齐这些能力：
+这里 `ds_name` 用作 `repo_id` / dataset 标识，`ds_root` 是真实本地数据目录。因为显式传入了 `root=ds_root`，本地读取不会再落到 `HF_LEROBOT_HOME / ds_name`。
+
+当前 v3 backend 主要保留这些能力：
 
 - 多 root 合并。
-- episode length 与全局 frame offset 计算。
-- `episode_data_index` 重建。
-- v3 初始化 index cache。
 - `dataset_index` 注入。
-- heterogeneous dataset bridge。
-- torchcodec 末帧 EOF fallback patch。
+- v3.0 chunked parquet / video layout 读取。
+- `delta_timestamps` 直接交给 v4 `LeRobotDataset` 处理。
+- `get_episode_data()` 会从 v3.0 chunk parquet 中按 `episode_index` 过滤单个 episode。
 
 ### 3.2 上下文帧查询
 
-v3 有两条路径：
+v3 backend 现在没有旧 adapter 的 strict non-idle 分支。`BaseLerobotDataset` 会把 `delta_timestamps` 直接传给 `lerobot_v4.MultiLeRobotDataset`，后者再传给每个 v4 `LeRobotDataset`。多帧上下文窗口由 v4 `LeRobotDataset` 内部根据 `delta_timestamps` 处理。
 
-1. 未启用 `nonidle_filter_path` 时，ImageWAM 把 `delta_timestamps` 直接传给外部 LeRobot v3 dataset。适配层的 `__getitem__()` 只负责把全局 index 映射成某个 root 内的 local index、调用 `dataset[local_idx]`、补充 `dataset_index` 和 hetero bridge 格式化。
-2. 启用 `nonidle_filter_path` 时，ImageWAM 进入 strict non-idle 路径。适配层构造外部 dataset 时会传入 `delta_timestamps=None` 和 `image_transforms=None`，外部 dataset 只负责读取单帧 anchor 或单帧 query；多帧上下文窗口由 `MultiLeRobotDatasetV3` 自己按过滤后的时间线重建。
-
-因此，v3 当前的普通读取路径仍复用外部 LeRobot v3；但 non-idle 场景下已经不是旧的 anchor-only 过滤，而是在适配层里实现了类似 v2 的 filtered timeline query。
+旧 `MultiLeRobotDatasetV3` adapter 支持的 `nonidle_filter_path`、`hetero_bridge`、`lerobot_v3_init_num_workers` 和 `lerobot_v3_index_cache` 不再传给 v4 backend；当前代码会记录 warning 并忽略这些参数。
 
 ## 4. Non-idle JSON 的含义
 
@@ -310,162 +308,55 @@ v2 non-idle 只改变 dataloader 看到的索引空间，不会删除 parquet �
 
 ## 6. v3 non-idle 实现
 
-v3 当前实现的是 strict non-idle filtered timeline。它仍然复用外部 LeRobot v3 dataset 负责底层单帧 parquet/video 读取，但上下文窗口不再交给外部 v3 的 `delta_timestamps` 逻辑，而是在 ImageWAM 的 `MultiLeRobotDatasetV3` 适配层中重建。
+当前 v3 backend 已经切到 `lerobot_v4.MultiLeRobotDataset`，不再使用旧 `MultiLeRobotDatasetV3` adapter 的 strict non-idle 实现。
 
-### 6.1 构建过滤列表
+因此，`nonidle_filter_path` 在 `lerobot_backend="v3"` 下会被忽略，并记录 warning。v3 backend 的 `num_frames` 直接来自各个 v4 子 dataset 的长度，`__getitem__()` 只负责把全局 index 映射到某个子 dataset 的 local index，再注入 `dataset_index`。
 
-`MultiLeRobotDatasetV3._load_nonidle_filter()` 会读取同一个 `nonidle_ranges.json`，为所有 root/episode 构建三张表：
+如果需要 no-op/idle 过滤，有两个当前可用路径：
 
-```python
-self._nonidle_filtered_indices
-self._nonidle_keep_indices_by_episode_pos
-self._nonidle_raw_index_to_keep_rank
-```
+1. 使用 v2 backend，继续走仓库内 `MultiLeRobotDataset` 的 non-idle 过滤。
+2. 先用 materialize 脚本把 v3 数据物理裁剪成新的 LeRobot v3 root，再用 v3 backend 读取裁剪后的数据。
 
-含义和 v2 一致。区别是 v3 没有直接使用 v2 的 `get_episode_data_index()`；它先从外部 v3 metadata 中读取每个 episode 的 `dataset_from_index` / `dataset_to_index`，得到 episode length，再由适配层重建跨 root 的全局 `episode_data_index`。
-
-构建过程：
-
-1. 为每个 root 初始化一个外部 `LeRobotDatasetV3`。
-2. 从 `meta.episodes` 中读取 episode index 和 episode length。
-3. 根据 `_episode_lengths_by_dataset` 构建全局 frame offset 和全局 `episode_data_index`。
-4. 读取 `nonidle_ranges.json`，把 episode 内局部 `[start, end)` 转成全局 frame index。
-5. 写入 `_nonidle_filtered_indices`、`_nonidle_keep_indices_by_episode_pos`、`_nonidle_raw_index_to_keep_rank`。
-
-v3 还支持 `lerobot_v3_index_cache`。这个 cache 存的是 root signature、episode selection、episode lengths 等初始化索引信息，用来减少重复启动时扫描 v3 metadata 的成本；它不是 non-idle JSON 的替代品。
-
-### 6.2 主帧过滤
-
-v3 的 `num_frames` 会在启用过滤时返回过滤后长度：
-
-```python
-if self._nonidle_filtered_indices is not None:
-    return len(self._nonidle_filtered_indices)
-```
-
-`__getitem__()` 会先映射：
-
-```python
-raw_idx = self._nonidle_filtered_indices[idx]
-dataset_idx, local_idx = self._resolve_frame_index(raw_idx)
-item = external_v3_dataset[local_idx]
-```
-
-所以 v3 当前也能保证 dataloader 的主采样帧来自 non-idle 区间。
-
-### 6.3 strict 模式下接管上下文窗口
-
-只要传入了 `nonidle_filter_path`，v3 adapter 会设置 `_strict_nonidle=True`。构造外部 v3 dataset 时会刻意关闭外部的多帧窗口和图像 transform：
-
-```python
-image_transforms=None if self._strict_nonidle else image_transforms
-delta_timestamps=None if self._strict_nonidle else child_delta_timestamps
-```
-
-然后 adapter 自己把 `child_delta_timestamps` 转成 `delta_indices`，保存在 `_V3DatasetEntry.delta_indices` 中。`__getitem__()` 检测到 `_nonidle_filtered_indices` 后会进入 `_getitem_strict_nonidle()`：
-
-```text
-idx -> raw_idx -> dataset_idx/local_idx -> anchor item
-raw_idx -> episode_pos -> keep_rank -> query_indices
-query_indices -> _query_strict_nonidle()
-```
-
-其中 `_get_strict_nonidle_query_indices()` 的 rank 逻辑和 v2 对齐：
-
-```text
-raw_idx -> keep_rank -> keep_rank + delta -> keep_indices[clamped_rank]
-```
-
-因此，当前 v3 strict non-idle 下，图像、state、action 的上下文窗口也沿过滤后的 non-idle 时间线采样。
-
-同样示例：
-
-```text
-原始时间线: A B idle idle C D
-过滤后:     A B C D
-```
-
-如果当前主帧是 `C`，并且需要前一帧：
-
-- v3 strict non-idle 会取 `B`。
-- 不会取 `C` 前面原始时间线里的 idle 帧。
-
-### 6.4 v3 strict 模式如何读取 query 帧
-
-v3 strict 模式没有直接批量 select parquet。它对每个 query index 做全局到 root-local 的映射：
-
-```text
-global query idx -> dataset_idx/q_local_idx
-```
-
-然后按字段类型选择读取方式：
-
-- 视觉字段：调用外部 `entry.dataset[q_local_idx]`，让外部 v3 dataset 解码该帧图像/视频。
-- 非视觉字段：优先调用外部 dataset 的 `get_raw_item(q_local_idx)`，避免不必要的视频解码；如果没有 `get_raw_item`，退回 `entry.dataset[q_local_idx]`。
-
-同一个 local index 会放进 `raw_cache` 或 `full_cache`，避免一个样本内重复读取同一帧。
-
-### 6.5 v3 strict 模式的限制
-
-v3 strict non-idle 依赖外部 v3 dataset 的单帧读取能力。它会自己重建上下文时间线，但底层视频 seek、parquet row 读取、task 字段格式等仍由外部 v3 实现决定。
-
-另外，strict query 会检查 query index 没有跨 dataset root。如果出现跨 root，说明 episode offset 或过滤表有问题，会直接抛错。
+旧文档中提到的 `_nonidle_filtered_indices`、`_strict_nonidle`、`_query_strict_nonidle()`、`lerobot_v3_index_cache` 都属于已移除的外部 v3 adapter 路径，不适用于当前 v4 alias。
 
 ## 7. v2/v3 dataset 差异总结
 
 | 维度 | v2 backend | v3 backend |
 | --- | --- | --- |
-| 底层实现 | 仓库内本地 `LeRobotDataset` | 外部 `lerobot` 包的 `LeRobotDataset` |
-| parquet 访问 | ImageWAM 直接通过 HF datasets 加载 | 外部 LeRobot v3 dataset 内部处理 |
-| 视频读取 | 本地代码控制视频 timestamp 查询与 decode | 外部 v3 控制，ImageWAM 只 patch EOF fallback |
-| `delta_timestamps` | ImageWAM 转为 `delta_indices` 后自己算 query index | 普通路径传给外部 v3；strict non-idle 路径由 ImageWAM 转为 `delta_indices` |
-| 多 root | `MultiLeRobotDataset` 合并多个本地 v2 dataset | `MultiLeRobotDatasetV3` 合并多个外部 v3 dataset |
-| episode index | v2 metadata + `get_episode_data_index()` | v3 metadata 的 `dataset_from_index/dataset_to_index` 重建 |
-| 上下文窗口 | ImageWAM 本地 `_get_query_indices()` 控制 | 普通路径由外部 v3 控制；strict non-idle 路径由 ImageWAM adapter 控制 |
-| non-idle 支持 | 完整过滤后时间线 | strict filtered timeline，主帧和上下文帧都按过滤后时间线 |
+| 底层实现 | 仓库内本地 `lerobot/lerobot_dataset.py` | 仓库内本地 `lerobot_v4/lerobot_dataset.py` |
+| parquet 访问 | ImageWAM 通过 HF datasets 加载 v2 layout | v4 `load_nested_dataset()` 加载 v3.0 chunked layout |
+| 视频读取 | 本地代码控制 video timestamp 查询与 decode | v4 本地 video utils 控制 decode |
+| `delta_timestamps` | ImageWAM 转为 `delta_indices` 后自己算 query index | 传给 v4 `LeRobotDataset` 处理 |
+| 多 root | `MultiLeRobotDataset` 合并多个本地 v2 dataset | `MultiLeRobotDatasetV3` alias 合并多个 v4 dataset |
+| episode index | v2 metadata + `get_episode_data_index()` | v4 metadata 的 `dataset_from_index/dataset_to_index` |
+| 上下文窗口 | ImageWAM 本地 `_get_query_indices()` 控制 | v4 `LeRobotDataset` 内部控制 |
+| non-idle 支持 | 完整过滤后时间线 | 当前忽略 `nonidle_filter_path` |
 
 ## 8. non-idle 差异总结
 
 | 维度 | v2 non-idle | v3 non-idle |
 | --- | --- | --- |
-| 使用同一 JSON | 是 | 是 |
-| 主帧过滤 | 是 | 是 |
-| `__len__()` 反映过滤后长度 | 是 | 是 |
-| dataloader index 映射到原始帧 | 是 | 是 |
-| 每 episode 保留帧表 | 是 | 是 |
-| 原始帧到过滤 rank 映射 | 是 | 是 |
-| 上下文帧沿过滤后时间线采样 | 是 | 是，strict non-idle 路径 |
-| 上下文帧可能包含 idle | 通常不会，除非 JSON 保留了该 idle 段 | 通常不会，除非 JSON 保留了该 idle 段 |
-| 底层单帧读取 | 本地 HF datasets + 本地 video decode | 外部 LeRobot v3 dataset |
-| 实现复杂度 | 高，因本地控制 parquet/video/query index | 中等，adapter 控制 filtered timeline，但单帧读取复用外部 v3 |
+| 使用同一 JSON | 是 | 否，当前忽略 |
+| 主帧过滤 | 是 | 否 |
+| `__len__()` 反映过滤后长度 | 是 | 否 |
+| dataloader index 映射到原始帧 | 是 | 否 |
+| 每 episode 保留帧表 | 是 | 否 |
+| 原始帧到过滤 rank 映射 | 是 | 否 |
+| 上下文帧沿过滤后时间线采样 | 是 | 否 |
+| 上下文帧可能包含 idle | 通常不会，除非 JSON 保留了该 idle 段 | 可能，取决于原始 v3 数据是否已经物理裁剪 |
+| 底层单帧读取 | 本地 HF datasets + 本地 video decode | v4 本地 HF datasets + video decode |
+| 实现复杂度 | 高，因本地控制 parquet/video/query index | 低，当前不做 adapter-level 过滤 |
 
 一句话总结：
 
 ```text
 v2: 主帧和上下文帧都按 non-idle 后的时间线采样。
-v3: 当前 strict non-idle 下，主帧和上下文帧也都按 non-idle 后的时间线采样；普通无 filter 路径仍由外部 v3 处理上下文。
+v3: 当前读取 v4 dataset 原始时间线；如需过滤，应先物理裁剪 v3 数据或使用 v2 backend。
 ```
 
-## 9. v3 strict non-idle 为什么这样实现
+## 9. v3 backend 参数兼容性
 
-v2 能直接完整实现 non-idle 时间线，是因为 ImageWAM 本地掌控以下逻辑：
-
-- `idx` 属于哪个 episode。
-- `delta_timestamps` 到整数 `delta_indices` 的转换。
-- 每个字段对应哪些 query indices。
-- query index 越界时如何 clamp 和生成 padding mask。
-- parquet 字段和视频帧如何根据 query indices 读取。
-
-v3 的普通路径把这些上下文窗口细节封装在外部 LeRobot v3 dataset 内部。为了在不 fork 外部 v3 读取器的情况下支持 filtered timeline，当前实现采用了 adapter-level strict 模式：
-
-1. 构造外部 v3 dataset 时关闭外部 `delta_timestamps`。
-2. 在 ImageWAM adapter 中维护 keep indices 和 raw-to-rank。
-3. 按 filtered rank 计算 query indices。
-4. 对每个 query index 调用外部 v3 dataset 的单帧读取能力。
-
-这个方案的好处是：filtered timeline 行为接近 v2，同时保留外部 LeRobot v3 对 v3 数据格式、视频 backend、raw item 读取等能力的支持。
-
-代价是：strict 模式下 query 帧是逐帧读取再 stack，不像 v2 那样可以对非视频字段直接 `hf_dataset.select(q_idx)` 批量读取。因此 v3 strict non-idle 的行为更正确，但性能特征会更依赖外部 v3 dataset 的单帧读取效率和视频 seek 成本。
+`BaseLerobotDataset` 仍保留 `lerobot_v3_init_num_workers`、`lerobot_v3_index_cache`、`nonidle_filter_path`、`hetero_bridge` 等配置入口，避免旧配置直接报错。但当 `lerobot_backend="v3"` 时，这些旧 adapter 参数不会传给 `lerobot_v4.MultiLeRobotDataset`，当前实现会记录 warning 并忽略它们。
 
 ## 10. RoboTwin v3 + FLUX.2 Klein 训练入口
 
@@ -492,24 +383,21 @@ robotwin_v3_flux2_klein_9b_base_imagewam
 data.data_root=./data/robotwin2.0_v3
 data.robotwin_root=${data.data_root}/robotwin2.0_v3
 data.train.lerobot_backend=v3
-data.train.lerobot_v3_index_cache=./dataset_meta/robotwin_v3_omnigen2_train_lerobot_v3_index.json
-data.val.lerobot_v3_index_cache=./dataset_meta/robotwin_v3_omnigen2_val_lerobot_v3_index.json
 ```
 
-如果数据集或 filter JSON 不在默认位置，可以直接传 Hydra override：
+如果数据集不在默认位置，可以直接传 Hydra override：
 
 ```bash
 TASK_TYPE=robotwin_v3 FLUX2_VARIANT=4b \
 bash scripts/flux2/run_train_flux2_klein_imagewam.sh \
   data.data_root=/path/to/data_root \
-  data.robotwin_root=/path/to/robotwin2.0_v3 \
-  data.nonidle_filter_path=/path/to/nonidle_ranges.json
+  data.robotwin_root=/path/to/robotwin2.0_v3
 ```
 
 ## 11. 实践建议
 
-如果目标是复现现有 RoboTwin v2 训练行为，v2 backend 和当前 v3 strict non-idle 在时间线语义上已经基本对齐：主帧和上下文帧都沿 filtered timeline 采样。
+如果目标是复现现有 RoboTwin v2 non-idle 训练行为，应继续使用 v2 backend，或先把 v3 数据物理裁剪后再训练。
 
-如果目标是使用 LeRobot v3 数据格式、torchcodec backend、v3 index cache 等能力，可以使用 v3 backend，并传入同一份 `nonidle_ranges.json`。当前 v3 strict non-idle 不再只是过滤 anchor frame，也会重建上下文窗口。
+如果目标是使用 LeRobot v3.0/v4 chunked 数据格式，可以使用 `lerobot_backend=v3`。这个 backend 当前会走 `lerobot_v4.MultiLeRobotDataset`，不会使用旧 `lerobot_v3_index_cache`，也不会消费 `nonidle_ranges.json`。
 
-如果后续实验发现 v3 strict non-idle 性能瓶颈明显，应优先优化 query 帧读取路径，例如对非视觉字段做更批量化的 raw row 读取，或减少视觉 query 的重复视频 seek。
+如果后续需要恢复 v3 adapter-level non-idle，需要在 `lerobot_v4.MultiLeRobotDataset` 内重新实现过滤后的 index space 和上下文窗口查询，而不是依赖已删除的旧 `lerobot_dataset_v3.py`。

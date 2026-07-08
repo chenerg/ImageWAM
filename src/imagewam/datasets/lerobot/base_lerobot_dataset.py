@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import List, Literal, Dict, Optional, Any, DefaultDict
 from tqdm import tqdm
 from .lerobot.lerobot_dataset import LeRobotDatasetMetadata, MultiLeRobotDataset
-from .lerobot.lerobot_dataset_v3 import MultiLeRobotDatasetV3
+from .lerobot_v4.lerobot_dataset import MultiLeRobotDatasetV3
 from .lerobot.datasets.video_utils import _PROFILE_CTX
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -261,16 +261,22 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             "dataset_dirs": self.dataset_dirs,
             "episodes": episodes,
             "delta_timestamps": delta_timestamps,
-            "nonidle_filter_path": nonidle_filter_path,
-            "hetero_bridge": hetero_bridge,
         }
         if self.lerobot_backend == "v2":
+            dataset_kwargs["nonidle_filter_path"] = nonidle_filter_path
+            dataset_kwargs["hetero_bridge"] = hetero_bridge
             dataset_kwargs["lerobot_meta_cache"] = meta_cache_by_root if meta_cache_by_root else None
             dataset_kwargs["hf_dataset_cache_dir"] = arrow_cache_dir
         else:
-            dataset_kwargs["init_num_workers"] = int(lerobot_v3_init_num_workers)
-            dataset_kwargs["index_cache_path"] = lerobot_v3_index_cache
             dataset_kwargs["video_backend"] = lerobot_v3_video_backend
+            if nonidle_filter_path is not None:
+                logger.warning("lerobot_backend='v3' now uses lerobot_v4 and ignores nonidle_filter_path.")
+            if hetero_bridge is not None:
+                logger.warning("lerobot_backend='v3' now uses lerobot_v4 and ignores hetero_bridge.")
+            if int(lerobot_v3_init_num_workers) != 1:
+                logger.warning("lerobot_backend='v3' now uses lerobot_v4 and ignores lerobot_v3_init_num_workers.")
+            if lerobot_v3_index_cache is not None:
+                logger.warning("lerobot_backend='v3' now uses lerobot_v4 and ignores lerobot_v3_index_cache.")
             if lerobot_tolerance_s is not None:
                 dataset_kwargs["tolerances_s"] = {
                     ds_dir: float(lerobot_tolerance_s)

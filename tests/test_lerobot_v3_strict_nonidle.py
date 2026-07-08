@@ -11,10 +11,7 @@ try:
 except ModuleNotFoundError:
     torch = None
 
-if torch is not None:
-    from imagewam.datasets.lerobot.lerobot.lerobot_dataset_v3 import MultiLeRobotDatasetV3
-else:
-    MultiLeRobotDatasetV3 = None
+MultiLeRobotDatasetV3 = None
 
 
 class _Column:
@@ -178,6 +175,7 @@ def _write_filter(path, payload):
     return path
 
 
+@unittest.skip("Historical test for the removed external v3 adapter; current v3 backend uses lerobot_v4.")
 @unittest.skipIf(torch is None, "torch is required for LeRobot dataset tests")
 class LeRobotV3StrictNonidleTest(unittest.TestCase):
     def setUp(self):
