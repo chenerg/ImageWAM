@@ -15,6 +15,7 @@
 # limitations under the License.
 import concurrent.futures
 import contextlib
+import json
 import logging
 import shutil
 import tempfile
@@ -578,6 +579,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         force_cache_sync: bool = False,
         download_videos: bool = True,
         video_backend: str | None = None,
+        nonidle_filter_path: str | Path | None = None,
         batch_encoding_size: int = 1,
         vcodec: str = "libsvtav1",
         streaming_encoding: bool = False,
@@ -716,6 +718,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.revision = revision if revision else CODEBASE_VERSION
         self.video_backend = video_backend if video_backend else get_safe_default_codec()
         self.delta_indices = None
+        self.nonidle_filter_path = None if nonidle_filter_path is None else Path(nonidle_filter_path).expanduser()
+        self._nonidle_filtered_indices: list[int] | None = None
+        self._nonidle_keep_indices_by_episode_pos: list[list[int]] | None = None
+        self._nonidle_raw_index_to_keep_rank: dict[int, int] | None = None
         self.batch_encoding_size = batch_encoding_size
         self.episodes_since_last_encoding = 0
         self.vcodec = resolve_vcodec(vcodec)
@@ -755,14 +761,13 @@ class LeRobotDataset(torch.utils.data.Dataset):
             self.download(download_videos)
             self.hf_dataset = self.load_hf_dataset()
 
-        # Create mapping from absolute indices to relative indices when only a subset of the episodes are loaded
-        # Build a mapping: absolute_index -> relative_index_in_filtered_dataset
+        # Create mapping from absolute indices to relative indices when only a subset of the episodes are loaded,
+        # or when non-idle filtering needs to map kept absolute indices back into the loaded HF dataset rows.
         self._absolute_to_relative_idx = None
-        if self.episodes is not None:
-            self._absolute_to_relative_idx = {
-                abs_idx.item() if isinstance(abs_idx, torch.Tensor) else abs_idx: rel_idx
-                for rel_idx, abs_idx in enumerate(self.hf_dataset["index"])
-            }
+        self._selected_episode_indices = self._get_selected_episode_indices()
+        self._episodes_to_pos = {int(ep): i for i, ep in enumerate(self._selected_episode_indices)}
+        self._refresh_absolute_to_relative_idx()
+        self._load_nonidle_filter()
 
         # Setup delta_indices
         if self.delta_timestamps is not None:
@@ -899,6 +904,91 @@ class LeRobotDataset(torch.utils.data.Dataset):
         hf_dataset.set_transform(hf_transform_to_torch)
         return hf_dataset
 
+    def _refresh_absolute_to_relative_idx(self) -> None:
+        """Build absolute-index lookup only when row positions may differ from frame indices."""
+        if self.hf_dataset is None:
+            self._absolute_to_relative_idx = None
+            return
+        if self.episodes is None and self.nonidle_filter_path is None:
+            self._absolute_to_relative_idx = None
+            return
+        self._absolute_to_relative_idx = {
+            int(abs_idx.item() if isinstance(abs_idx, torch.Tensor) else abs_idx): rel_idx
+            for rel_idx, abs_idx in enumerate(self.hf_dataset["index"])
+        }
+
+    def _get_selected_episode_indices(self) -> list[int]:
+        if self.episodes is not None:
+            return [int(ep_idx) for ep_idx in self.episodes]
+        return [int(self.meta.episodes[idx]["episode_index"]) for idx in range(len(self.meta.episodes))]
+
+    def _load_nonidle_filter(self) -> None:
+        if self.nonidle_filter_path is None:
+            self._nonidle_filtered_indices = None
+            self._nonidle_keep_indices_by_episode_pos = None
+            self._nonidle_raw_index_to_keep_rank = None
+            return
+        if self.hf_dataset is None:
+            return
+        if not self.nonidle_filter_path.exists():
+            raise FileNotFoundError(f"Non-idle filter JSON not found: {self.nonidle_filter_path}")
+
+        payload = json.loads(self.nonidle_filter_path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict) and "episodes" in payload:
+            episode_ranges = payload["episodes"]
+        else:
+            episode_ranges = payload
+        if not isinstance(episode_ranges, dict):
+            raise ValueError(
+                f"Non-idle filter JSON must contain an episode range mapping, got {type(episode_ranges)}"
+            )
+
+        if self._absolute_to_relative_idx is None:
+            self._refresh_absolute_to_relative_idx()
+        if self._absolute_to_relative_idx is None:
+            raise RuntimeError("Could not build absolute-to-relative index mapping for non-idle filter.")
+
+        filtered_relative_indices: list[int] = []
+        keep_by_episode_pos: list[list[int]] = []
+        raw_to_rank: dict[int, int] = {}
+
+        for episode_idx in self._selected_episode_indices:
+            ep = self.meta.episodes[episode_idx]
+            ep_start = int(ep["dataset_from_index"])
+            ep_end = int(ep["dataset_to_index"])
+            ranges = episode_ranges.get(str(episode_idx), episode_ranges.get(episode_idx, None))
+            if ranges is None:
+                keep_indices = list(range(ep_start, ep_end))
+            else:
+                keep_indices = []
+                for raw_start, raw_end in ranges:
+                    start = max(0, int(raw_start))
+                    end = min(ep_end - ep_start, int(raw_end))
+                    if end <= start:
+                        continue
+                    keep_indices.extend(range(ep_start + start, ep_start + end))
+
+            keep_indices = sorted(set(keep_indices))
+            keep_by_episode_pos.append(keep_indices)
+            for keep_rank, raw_idx in enumerate(keep_indices):
+                raw_to_rank[int(raw_idx)] = keep_rank
+                relative_idx = self._absolute_to_relative_idx.get(int(raw_idx))
+                if relative_idx is not None:
+                    filtered_relative_indices.append(relative_idx)
+
+        if len(filtered_relative_indices) == 0:
+            raise ValueError(f"Non-idle filter removed all frames: {self.nonidle_filter_path}")
+
+        self._nonidle_filtered_indices = filtered_relative_indices
+        self._nonidle_keep_indices_by_episode_pos = keep_by_episode_pos
+        self._nonidle_raw_index_to_keep_rank = raw_to_rank
+        logging.info(
+            "Loaded non-idle filter %s: kept %d/%d frames.",
+            self.nonidle_filter_path,
+            len(filtered_relative_indices),
+            len(self.hf_dataset),
+        )
+
     def _check_cached_episodes_sufficient(self) -> bool:
         """Check if the cached dataset contains all requested episodes and their video files."""
         if self.hf_dataset is None or len(self.hf_dataset) == 0:
@@ -950,6 +1040,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         actual loaded data length (len(self.hf_dataset)) rather than metadata total_frames.
         self.meta.total_frames is the total number of frames in the full dataset.
         """
+        if self._nonidle_filtered_indices is not None:
+            return len(self._nonidle_filtered_indices)
         if self.episodes is not None and self.hf_dataset is not None:
             return len(self.hf_dataset)
         return self.meta.total_frames
@@ -985,6 +1077,34 @@ class LeRobotDataset(torch.utils.data.Dataset):
             - query_indices: Dict mapping keys to lists of absolute indices to query
             - padding: Dict mapping "{key}_is_pad" to boolean tensors indicating padded positions
         """
+        if self._nonidle_filtered_indices is not None:
+            if (
+                self._nonidle_keep_indices_by_episode_pos is None
+                or self._nonidle_raw_index_to_keep_rank is None
+            ):
+                raise RuntimeError("Non-idle filter index tables are not initialized.")
+            episode_pos = self._episodes_to_pos[ep_idx]
+            keep_indices = self._nonidle_keep_indices_by_episode_pos[episode_pos]
+            if len(keep_indices) == 0:
+                raise IndexError(f"Episode {ep_idx} has no non-idle frames.")
+            if abs_idx not in self._nonidle_raw_index_to_keep_rank:
+                raise IndexError(f"Absolute index {abs_idx} is not in the non-idle filter.")
+            keep_rank = self._nonidle_raw_index_to_keep_rank[abs_idx]
+            query_indices = {}
+            padding = {}
+            for key, delta_idx in self.delta_indices.items():
+                cur_indices = []
+                cur_padding = []
+                for delta in delta_idx:
+                    target_rank = keep_rank + int(delta)
+                    is_pad = target_rank < 0 or target_rank >= len(keep_indices)
+                    clamped_rank = max(0, min(len(keep_indices) - 1, target_rank))
+                    cur_indices.append(int(keep_indices[clamped_rank]))
+                    cur_padding.append(bool(is_pad))
+                query_indices[key] = cur_indices
+                padding[f"{key}_is_pad"] = torch.BoolTensor(cur_padding)
+            return query_indices, padding
+
         ep = self.meta.episodes[ep_idx]
         ep_start = ep["dataset_from_index"]
         ep_end = ep["dataset_to_index"]
@@ -1076,6 +1196,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 self._close_writer()
                 self._writer_closed_for_reading = True
             self.hf_dataset = self.load_hf_dataset()
+            self._selected_episode_indices = self._get_selected_episode_indices()
+            self._episodes_to_pos = {int(ep): i for i, ep in enumerate(self._selected_episode_indices)}
+            self._refresh_absolute_to_relative_idx()
+            self._load_nonidle_filter()
             self._lazy_loading = False
 
     def __len__(self):
@@ -1084,7 +1208,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx) -> dict:
         # Ensure dataset is loaded when we actually need to read from it
         self._ensure_hf_dataset_loaded()
-        item = self.hf_dataset[idx]
+        row_idx = int(self._nonidle_filtered_indices[idx]) if self._nonidle_filtered_indices is not None else idx
+        item = self.hf_dataset[row_idx]
         ep_idx = item["episode_index"].item()
         # Use the absolute index from the dataset for delta timestamp calculations
         abs_idx = item["index"].item()
@@ -1693,7 +1818,13 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.image_transforms = None
         obj.delta_timestamps = None
         obj.delta_indices = None
+        obj.nonidle_filter_path = None
+        obj._nonidle_filtered_indices = None
+        obj._nonidle_keep_indices_by_episode_pos = None
+        obj._nonidle_raw_index_to_keep_rank = None
         obj._absolute_to_relative_idx = None
+        obj._selected_episode_indices = []
+        obj._episodes_to_pos = {}
         obj.video_backend = video_backend if video_backend is not None else get_safe_default_codec()
         obj.writer = None
         obj.latest_episode = None
@@ -1734,9 +1865,9 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         episodes: dict | None = None,
         image_transforms: Callable | None = None,
         delta_timestamps: dict[str, list[float]] | None = None,
-        tolerances_s: dict | None = None,
         download_videos: bool = True,
         video_backend: str | None = None,
+        nonidle_filter_path: str | Path | None = None,
     ):
         super().__init__()
         self.dataset_dirs = dataset_dirs
@@ -1744,7 +1875,6 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         ds_names = [ds_dir for ds_dir in dataset_dirs]
         self.ds_names = ds_names
         self.ds_roots = ds_roots
-        self.tolerances_s = tolerances_s if tolerances_s else dict.fromkeys(ds_names, 0.0001)
         # Construct the underlying datasets passing everything but `transform` and `delta_timestamps` which
         # are handled by this class.
         self._datasets = [
@@ -1754,9 +1884,9 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
                 episodes=episodes[ds_name] if episodes else None,
                 image_transforms=image_transforms,
                 delta_timestamps=delta_timestamps,
-                tolerance_s=self.tolerances_s[ds_name],
                 download_videos=download_videos,
                 video_backend=video_backend,
+                nonidle_filter_path=nonidle_filter_path,
             )
             for ds_root, ds_name in zip(ds_roots, ds_names, strict=True)
         ]

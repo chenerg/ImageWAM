@@ -114,9 +114,6 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         lerobot_meta_cache: Optional[str] = None,
         arrow_cache_dir: Optional[str] = None,
         lerobot_backend: str = "v2",
-        lerobot_v3_init_num_workers: int = 1,
-        lerobot_v3_index_cache: Optional[str] = None,
-        lerobot_tolerance_s: Optional[float] = None,
         episode_index_filter: Optional[Dict[str, Any]] = None,
     ):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
@@ -267,19 +264,9 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             dataset_kwargs["lerobot_meta_cache"] = meta_cache_by_root if meta_cache_by_root else None
             dataset_kwargs["hf_dataset_cache_dir"] = arrow_cache_dir
         else:
-            if nonidle_filter_path is not None:
-                logger.warning("lerobot_backend='v3' now uses lerobot_v4 and ignores nonidle_filter_path.")
+            dataset_kwargs["nonidle_filter_path"] = nonidle_filter_path
             if hetero_bridge is not None:
                 logger.warning("lerobot_backend='v3' now uses lerobot_v4 and ignores hetero_bridge.")
-            if int(lerobot_v3_init_num_workers) != 1:
-                logger.warning("lerobot_backend='v3' now uses lerobot_v4 and ignores lerobot_v3_init_num_workers.")
-            if lerobot_v3_index_cache is not None:
-                logger.warning("lerobot_backend='v3' now uses lerobot_v4 and ignores lerobot_v3_index_cache.")
-            if lerobot_tolerance_s is not None:
-                dataset_kwargs["tolerances_s"] = {
-                    ds_dir: float(lerobot_tolerance_s)
-                    for ds_dir in self.dataset_dirs
-                }
 
         self.multi_dataset = dataset_cls(
             **dataset_kwargs,

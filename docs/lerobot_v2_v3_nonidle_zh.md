@@ -104,7 +104,7 @@ LeRobotDataset(
 
 v3 backend 现在没有旧 adapter 的 strict non-idle 分支。`BaseLerobotDataset` 会把 `delta_timestamps` 直接传给 `lerobot_v4.MultiLeRobotDataset`，后者再传给每个 v4 `LeRobotDataset`。多帧上下文窗口由 v4 `LeRobotDataset` 内部根据 `delta_timestamps` 处理。
 
-旧 `MultiLeRobotDatasetV3` adapter 支持的 `nonidle_filter_path`、`hetero_bridge`、`lerobot_v3_init_num_workers` 和 `lerobot_v3_index_cache` 不再传给 v4 backend；当前代码会记录 warning 并忽略这些参数。
+当前 v3 backend 会把 `nonidle_filter_path` 传给 v4 backend，由 v4 `LeRobotDataset` 按过滤后的时间线处理主帧和上下文帧。`hetero_bridge` 仍属于 v2 backend 能力，在 v3 backend 下会被忽略。
 
 ## 4. Non-idle JSON 的含义
 
@@ -310,14 +310,14 @@ v2 non-idle 只改变 dataloader 看到的索引空间，不会删除 parquet �
 
 当前 v3 backend 已经切到 `lerobot_v4.MultiLeRobotDataset`，不再使用旧 `MultiLeRobotDatasetV3` adapter 的 strict non-idle 实现。
 
-因此，`nonidle_filter_path` 在 `lerobot_backend="v3"` 下会被忽略，并记录 warning。v3 backend 的 `num_frames` 直接来自各个 v4 子 dataset 的长度，`__getitem__()` 只负责把全局 index 映射到某个子 dataset 的 local index，再注入 `dataset_index`。
+`nonidle_filter_path` 在 `lerobot_backend="v3"` 下会传给 v4 子 dataset。v3 backend 的 `num_frames` 会反映过滤后的长度，`__getitem__()` 会先映射到过滤后的子 dataset local index，再注入 `dataset_index`。
 
 如果需要 no-op/idle 过滤，有两个当前可用路径：
 
 1. 使用 v2 backend，继续走仓库内 `MultiLeRobotDataset` 的 non-idle 过滤。
-2. 先用 materialize 脚本把 v3 数据物理裁剪成新的 LeRobot v3 root，再用 v3 backend 读取裁剪后的数据。
+2. 使用 v3 backend，直接传入同格式的 `nonidle_filter_path`，由 v4 `LeRobotDataset` 在线过滤。
 
-旧文档中提到的 `_nonidle_filtered_indices`、`_strict_nonidle`、`_query_strict_nonidle()`、`lerobot_v3_index_cache` 都属于已移除的外部 v3 adapter 路径，不适用于当前 v4 alias。
+旧文档中提到的 `_strict_nonidle()` 和 `_query_strict_nonidle()` 属于已移除的外部 v3 adapter 路径，不适用于当前 v4 alias。
 
 ## 7. v2/v3 dataset 差异总结
 
@@ -330,33 +330,33 @@ v2 non-idle 只改变 dataloader 看到的索引空间，不会删除 parquet �
 | 多 root | `MultiLeRobotDataset` 合并多个本地 v2 dataset | `MultiLeRobotDatasetV3` alias 合并多个 v4 dataset |
 | episode index | v2 metadata + `get_episode_data_index()` | v4 metadata 的 `dataset_from_index/dataset_to_index` |
 | 上下文窗口 | ImageWAM 本地 `_get_query_indices()` 控制 | v4 `LeRobotDataset` 内部控制 |
-| non-idle 支持 | 完整过滤后时间线 | 当前忽略 `nonidle_filter_path` |
+| non-idle 支持 | 完整过滤后时间线 | 完整过滤后时间线 |
 
 ## 8. non-idle 差异总结
 
 | 维度 | v2 non-idle | v3 non-idle |
 | --- | --- | --- |
-| 使用同一 JSON | 是 | 否，当前忽略 |
-| 主帧过滤 | 是 | 否 |
-| `__len__()` 反映过滤后长度 | 是 | 否 |
-| dataloader index 映射到原始帧 | 是 | 否 |
-| 每 episode 保留帧表 | 是 | 否 |
-| 原始帧到过滤 rank 映射 | 是 | 否 |
-| 上下文帧沿过滤后时间线采样 | 是 | 否 |
-| 上下文帧可能包含 idle | 通常不会，除非 JSON 保留了该 idle 段 | 可能，取决于原始 v3 数据是否已经物理裁剪 |
+| 使用同一 JSON | 是 | 是 |
+| 主帧过滤 | 是 | 是 |
+| `__len__()` 反映过滤后长度 | 是 | 是 |
+| dataloader index 映射到原始帧 | 是 | 是 |
+| 每 episode 保留帧表 | 是 | 是 |
+| 原始帧到过滤 rank 映射 | 是 | 是 |
+| 上下文帧沿过滤后时间线采样 | 是 | 是 |
+| 上下文帧可能包含 idle | 通常不会，除非 JSON 保留了该 idle 段 | 通常不会，除非 JSON 保留了该 idle 段 |
 | 底层单帧读取 | 本地 HF datasets + 本地 video decode | v4 本地 HF datasets + video decode |
-| 实现复杂度 | 高，因本地控制 parquet/video/query index | 低，当前不做 adapter-level 过滤 |
+| 实现复杂度 | 高，因本地控制 parquet/video/query index | 中等，v4 子 dataset 内维护过滤 index space |
 
 一句话总结：
 
 ```text
 v2: 主帧和上下文帧都按 non-idle 后的时间线采样。
-v3: 当前读取 v4 dataset 原始时间线；如需过滤，应先物理裁剪 v3 数据或使用 v2 backend。
+v3: 主帧和上下文帧都按 non-idle 后的时间线采样。
 ```
 
 ## 9. v3 backend 参数兼容性
 
-`BaseLerobotDataset` 仍保留 `lerobot_v3_init_num_workers`、`lerobot_v3_index_cache`、`nonidle_filter_path`、`hetero_bridge` 等配置入口，避免旧配置直接报错。但当 `lerobot_backend="v3"` 时，这些旧 adapter 参数不会传给 `lerobot_v4.MultiLeRobotDataset`，当前实现会记录 warning 并忽略它们。
+`BaseLerobotDataset` 的 v3 backend 当前会把 `nonidle_filter_path` 传给 `lerobot_v4.MultiLeRobotDataset`。`hetero_bridge` 仍只适用于 v2 backend，在 v3 backend 下会记录 warning 并忽略。
 
 ## 10. RoboTwin v3 + FLUX.2 Klein 训练入口
 
@@ -396,8 +396,8 @@ bash scripts/flux2/run_train_flux2_klein_imagewam.sh \
 
 ## 11. 实践建议
 
-如果目标是复现现有 RoboTwin v2 non-idle 训练行为，应继续使用 v2 backend，或先把 v3 数据物理裁剪后再训练。
+如果目标是复现现有 RoboTwin v2 non-idle 训练行为，可以继续使用 v2 backend，也可以使用 v3 backend 读取 v3.0/v4 chunked 数据并传入同格式的 non-idle ranges JSON。
 
-如果目标是使用 LeRobot v3.0/v4 chunked 数据格式，可以使用 `lerobot_backend=v3`。这个 backend 当前会走 `lerobot_v4.MultiLeRobotDataset`，不会使用旧 `lerobot_v3_index_cache`，也不会消费 `nonidle_ranges.json`。
+如果目标是使用 LeRobot v3.0/v4 chunked 数据格式，可以使用 `lerobot_backend=v3`。这个 backend 当前会走 `lerobot_v4.MultiLeRobotDataset`，并可消费 `nonidle_ranges.json`。
 
-如果后续需要恢复 v3 adapter-level non-idle，需要在 `lerobot_v4.MultiLeRobotDataset` 内重新实现过滤后的 index space 和上下文窗口查询，而不是依赖已删除的旧 `lerobot_dataset_v3.py`。
+v3 backend 不再提供旧 adapter 的专用索引缓存和并行初始化配置；初始化路径由 v4 dataset 实现负责。

@@ -64,9 +64,6 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         lerobot_meta_cache: Optional[str] = None,
         arrow_cache_dir: Optional[str] = None,
         lerobot_backend: str = "v2",
-        lerobot_v3_init_num_workers: int = 1,
-        lerobot_v3_index_cache: Optional[str] = None,
-        lerobot_tolerance_s: Optional[float] = None,
         episode_index_filter: Optional[dict] = None,
         slow_getitem_log_sec: float = 0.0,
     ):
@@ -92,9 +89,6 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             lerobot_meta_cache=lerobot_meta_cache,
             arrow_cache_dir=arrow_cache_dir,
             lerobot_backend=lerobot_backend,
-            lerobot_v3_init_num_workers=lerobot_v3_init_num_workers,
-            lerobot_v3_index_cache=lerobot_v3_index_cache,
-            lerobot_tolerance_s=lerobot_tolerance_s,
             episode_index_filter=OmegaConf.to_container(episode_index_filter, resolve=True) if isinstance(episode_index_filter, DictConfig) else episode_index_filter,
         )
     
