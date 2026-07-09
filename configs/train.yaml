@@ -39,7 +39,6 @@ flux2_qwen3_model_spec: null
 # InternData-A1 preprocessing/cache controls
 precache_arrow: true
 precache_num_workers: 4
-build_lerobot_meta_cache: true
 build_norm_stats: true
 precache_fuse_norm_stats: true
 force_rebuild_norm_stats: false

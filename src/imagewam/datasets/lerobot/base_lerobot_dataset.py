@@ -1,12 +1,11 @@
 import torch
 import numpy as np
-import json
 import os
 from pathlib import Path
 from typing import List, Literal, Dict, Optional, Any, DefaultDict
 from tqdm import tqdm
-from .lerobot.lerobot_dataset import LeRobotDatasetMetadata, MultiLeRobotDataset
-from .lerobot_v4.lerobot_dataset import MultiLeRobotDatasetV3
+from .lerobot.lerobot_dataset import MultiLeRobotDataset
+from .lerobot.datasets.utils import load_info
 from .lerobot.datasets.video_utils import _PROFILE_CTX
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -31,25 +30,6 @@ def _profile_init_min_sec() -> float:
         return 0.0
 
 
-class _CachedLeRobotMeta:
-    def __init__(self, repo_id: str, root: Path, payload: dict[str, Any]):
-        self.repo_id = repo_id
-        self.root = root
-        self.info = payload["info"]
-        self.episodes = {
-            int(ep["episode_index"]): ep
-            for ep in payload.get("episodes", [])
-        }
-
-    @property
-    def fps(self) -> int:
-        return int(self.info["fps"])
-
-    @property
-    def total_episodes(self) -> int:
-        return int(self.info["total_episodes"])
-
-
 class _InfoLeRobotMeta:
     def __init__(self, repo_id: str, root: Path, info: dict[str, Any]):
         self.repo_id = repo_id
@@ -64,27 +44,6 @@ class _InfoLeRobotMeta:
     def total_episodes(self) -> int:
         return int(self.info["total_episodes"])
 
-
-def _read_lerobot_meta_cache(path: str | Path) -> dict[str, dict[str, Any]]:
-    cache_path = Path(path).expanduser()
-    if not cache_path.exists():
-        raise FileNotFoundError(f"LeRobot meta cache not found: {cache_path}")
-    with cache_path.open("r", encoding="utf-8") as f:
-        payload = json.load(f)
-    records = payload.get("datasets", payload)
-    if isinstance(records, dict):
-        iterable = records.values()
-    else:
-        iterable = records
-    cache = {}
-    for record in iterable:
-        root = str(Path(record["root"]).expanduser().resolve())
-        cache[root] = record
-    return cache
-
-
-def _empty_lerobot_meta_cache() -> dict[str, dict[str, Any]]:
-    return {}
 
 class BaseLerobotDataset(torch.utils.data.Dataset):
     def __init__(
@@ -109,13 +68,6 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         sample_index_stride: int = 1,
         image_obs_indices: Optional[List[int]] = None,
         profile_getitem: bool = False,
-        hetero_bridge: Optional[Dict[str, Any]] = None,
-        lerobot_meta_cache: Optional[str] = None,
-        arrow_cache_dir: Optional[str] = None,
-        lerobot_backend: str = "v2",
-        lerobot_v3_init_num_workers: int = 1,
-        lerobot_v3_index_cache: Optional[str] = None,
-        lerobot_tolerance_s: Optional[float] = None,
         episode_index_filter: Optional[Dict[str, Any]] = None,
     ):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
@@ -152,30 +104,13 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         self.obs_size = obs_size
         self.processor = None  # Will be set externally
         self.profile_getitem = bool(profile_getitem)
-        self.hetero_bridge = hetero_bridge
         self.episode_index_filter = episode_index_filter
-        self.lerobot_backend = str(lerobot_backend).strip().lower()
-        if self.lerobot_backend not in {"v2", "v3"}:
-            raise ValueError(f"Unsupported lerobot_backend={lerobot_backend!r}. Expected 'v2' or 'v3'.")
-        meta_cache_by_root = (
-            self._load_lerobot_meta_cache(lerobot_meta_cache)
-            if self.lerobot_backend == "v2"
-            else _empty_lerobot_meta_cache()
-        )
-        _mark("load_meta_cache", cached_roots=len(meta_cache_by_root))
         metas = []
-        for ds_dir in tqdm(dataset_dirs, desc=f"Loading LeRobot {self.lerobot_backend} root metadata"):
+        for ds_dir in tqdm(dataset_dirs, desc="Loading LeRobot root metadata"):
             ds_root = Path(ds_dir)
             repo_id = ds_dir
-            cached_meta = meta_cache_by_root.get(str(ds_root.resolve()))
-            if cached_meta is not None:
-                metas.append(_CachedLeRobotMeta(repo_id=repo_id, root=ds_root, payload=cached_meta))
-            elif self.lerobot_backend == "v3":
-                with (ds_root / "meta" / "info.json").open("r", encoding="utf-8") as f:
-                    metas.append(_InfoLeRobotMeta(repo_id=repo_id, root=ds_root, info=json.load(f)))
-            else:
-                meta = LeRobotDatasetMetadata(repo_id=repo_id, root=ds_root)
-                metas.append(meta)
+            info = load_info(ds_root)
+            metas.append(_InfoLeRobotMeta(repo_id=repo_id, root=ds_root, info=info))
         _mark("build_lightweight_metas", roots=len(metas))
 
         fps_list = [m.fps for m in metas]
@@ -254,30 +189,13 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
                     episode_indices = episode_indices[:split_idx] if self.is_training_set else episode_indices[split_idx:]
                 episodes.update({meta.repo_id: episode_indices})
 
-        dataset_cls = MultiLeRobotDatasetV3 if self.lerobot_backend == "v3" else MultiLeRobotDataset
         dataset_kwargs = {
             "dataset_dirs": self.dataset_dirs,
             "episodes": episodes,
             "delta_timestamps": delta_timestamps,
         }
-        if self.lerobot_backend == "v2":
-            dataset_kwargs["hetero_bridge"] = hetero_bridge
-            dataset_kwargs["lerobot_meta_cache"] = meta_cache_by_root if meta_cache_by_root else None
-            dataset_kwargs["hf_dataset_cache_dir"] = arrow_cache_dir
-        else:
-            if hetero_bridge is not None:
-                logger.warning("lerobot_backend='v3' now uses lerobot_v4 and ignores hetero_bridge.")
-            if int(lerobot_v3_init_num_workers) != 1:
-                logger.warning("lerobot_backend='v3' now uses lerobot_v4 and ignores lerobot_v3_init_num_workers.")
-            if lerobot_v3_index_cache is not None:
-                logger.warning("lerobot_backend='v3' now uses lerobot_v4 and ignores lerobot_v3_index_cache.")
-            if lerobot_tolerance_s is not None:
-                dataset_kwargs["tolerances_s"] = {
-                    ds_dir: float(lerobot_tolerance_s)
-                    for ds_dir in self.dataset_dirs
-                }
 
-        self.multi_dataset = dataset_cls(
+        self.multi_dataset = MultiLeRobotDataset(
             **dataset_kwargs,
         )
         _mark("multi_dataset_init", roots=len(self.multi_dataset._datasets))
@@ -302,12 +220,6 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             }
         _mark("merge_episode_index")
         _mark("total")
-
-    @staticmethod
-    def _load_lerobot_meta_cache(path: Optional[str]) -> dict[str, dict[str, Any]]:
-        if path is None or str(path).strip() == "":
-            return _empty_lerobot_meta_cache()
-        return _read_lerobot_meta_cache(path)
 
     def _filter_episode_indices(self, episode_indices: list[int], repo_id: str) -> list[int]:
         cfg = self.episode_index_filter
@@ -496,9 +408,6 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         return self
 
     def get_dataset_stats(self, preprocessor: BaseProcessor):
-        if getattr(self.multi_dataset, "hetero_bridge", None) is not None:
-            return self._get_per_embodiment_dataset_stats(preprocessor)
-
         state_min = DefaultDict(list)
         state_max = DefaultDict(list)
         state_mean = DefaultDict(list)

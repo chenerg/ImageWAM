@@ -49,17 +49,7 @@ case "${TASK_TYPE}" in
       exit 1
     fi
     ;;
-  robotwin_v3)
-    ACTION_DIM=14
-    TASK_NAME="robotwin_v3_${TASK_SUFFIX}"
-    if [ "${USE_CLEAN_ROBOTWIN}" = "true" ]; then
-      TASK_NAME="${TASK_NAME/_imagewam/_clean_imagewam}"
-    elif [ "${USE_CLEAN_ROBOTWIN}" != "false" ]; then
-      echo "Invalid USE_CLEAN_ROBOTWIN=${USE_CLEAN_ROBOTWIN}; expected true or false" >&2
-      exit 1
-    fi
-    ;;
-  *) echo "Invalid TASK_TYPE=${TASK_TYPE}; expected libero or robotwin or robotwin_v3" >&2; exit 1 ;;
+  *) echo "Invalid TASK_TYPE=${TASK_TYPE}; expected libero or robotwin" >&2; exit 1 ;;
 esac
 
 ACTION_INIT="${ACTION_INIT:-checkpoints/action_dit_flux2_${FLUX2_VARIANT}_${TASK_TYPE}_init.pt}"

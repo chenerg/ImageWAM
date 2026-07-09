@@ -41,85 +41,9 @@ train:
   val_set_proportion: 0.0
   is_training_set: true
   pretrained_norm_stats: ./dataset_meta/interndata_a1_ee_dataset_stats.json
-  lerobot_meta_cache: ./dataset_meta/interndata_a1_lerobot_meta.json
-  arrow_cache_dir: /dockerdata/hf_datasets_cache_interndata_a1
   skip_padding_as_possible: false
   concat_multi_camera: "robotwin"
   robotwin_camera_layout: "legacy_384x320"
-  hetero_bridge:
-    enabled: true
-    canonical:
-      action_key: action
-      state_key: observation.state
-      image_keys:
-        cam_high: observation.images.cam_high
-        cam_left: observation.images.cam_left
-        cam_right: observation.images.cam_right
-    embodiments:
-      franka:
-        path_patterns: ["/franka/"]
-        images:
-          cam_high: images.rgb.head
-          cam_left: images.rgb.hand
-          cam_right: null
-        state:
-          left_pose: states.ee_to_robot_pose
-          left_gripper: states.gripper.position
-          right_pose: null
-          right_gripper: null
-        action:
-          left_pose: actions.ee_to_robot_pose
-          left_gripper: actions.gripper.position
-          right_pose: null
-          right_gripper: null
-      lift2:
-        path_patterns: ["/lift2/"]
-        images:
-          cam_high: images.rgb.head
-          cam_left: images.rgb.hand_left
-          cam_right: images.rgb.hand_right
-        state:
-          left_pose: states.left_ee_to_robot_pose
-          left_gripper: states.left_gripper.position
-          right_pose: states.right_ee_to_robot_pose
-          right_gripper: states.right_gripper.position
-        action:
-          left_pose: actions.left_ee_to_robot_pose
-          left_gripper: actions.left_gripper.position
-          right_pose: actions.right_ee_to_robot_pose
-          right_gripper: actions.right_gripper.position
-      split_aloha:
-        path_patterns: ["/split_aloha/"]
-        images:
-          cam_high: images.rgb.head
-          cam_left: images.rgb.hand_left
-          cam_right: images.rgb.hand_right
-        state:
-          left_pose: states.left_ee_to_robot_pose
-          left_gripper: states.left_gripper.position
-          right_pose: states.right_ee_to_robot_pose
-          right_gripper: states.right_gripper.position
-        action:
-          left_pose: actions.left_ee_to_robot_pose
-          left_gripper: actions.left_gripper.position
-          right_pose: actions.right_ee_to_robot_pose
-          right_gripper: actions.right_gripper.position
-      genie1:
-        path_patterns: ["/genie1/"]
-        images:
-          cam_high: images.rgb.head
-          cam_left: images.rgb.hand_left
-          cam_right: images.rgb.hand_right
-        state:
-          left_pose: states.left_ee_to_robot_pose
-          left_gripper: states.left_gripper.position
-          right_pose: states.right_ee_to_robot_pose
-          right_gripper: states.right_gripper.position
-        action:
-          left_pose: actions.left_ee_to_robot_pose
-          left_gripper: actions.left_gripper.position
-          right_pose: actions.right_ee_to_robot_pose
-          right_gripper: actions.right_gripper.position
   processor:
     _target_: imagewam.datasets.lerobot.processors.imagewam_processor.ImageWAMProcessor
     shape_meta: ${data.train.shape_meta}
@@ -160,12 +84,9 @@ val:
   val_set_proportion: 0.01
   is_training_set: false
   pretrained_norm_stats: ${data.train.pretrained_norm_stats}
-  lerobot_meta_cache: ${data.train.lerobot_meta_cache}
-  arrow_cache_dir: ${data.train.arrow_cache_dir}
   skip_padding_as_possible: false
   concat_multi_camera: ${data.train.concat_multi_camera}
   robotwin_camera_layout: ${data.train.robotwin_camera_layout}
-  hetero_bridge: ${data.train.hetero_bridge}
   processor:
     _target_: imagewam.datasets.lerobot.processors.imagewam_processor.ImageWAMProcessor
     shape_meta: ${data.train.shape_meta}

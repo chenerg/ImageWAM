@@ -59,21 +59,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         profile_getitem: bool = False,
         condition_frame_augmentation: Optional[dict] = None,
         video_augmentation: Optional[dict] = None,
-        hetero_bridge: Optional[dict] = None,
-        lerobot_meta_cache: Optional[str] = None,
-        arrow_cache_dir: Optional[str] = None,
-        lerobot_backend: str = "v2",
-        lerobot_v3_init_num_workers: int = 1,
-        lerobot_v3_index_cache: Optional[str] = None,
-        lerobot_tolerance_s: Optional[float] = None,
         episode_index_filter: Optional[dict] = None,
-        slow_getitem_log_sec: float = 0.0,
     ):
         image_obs_indices = [0, num_frames - 1] if endpoint_frames_only else None
-        self.slow_getitem_log_sec = float(
-            os.environ.get("IMAGEWAM_SLOW_GETITEM_LOG_SEC", slow_getitem_log_sec)
-        )
-        effective_profile_getitem = bool(profile_getitem) or self.slow_getitem_log_sec > 0.0
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
             shape_meta=OmegaConf.to_container(shape_meta, resolve=True),
@@ -85,14 +73,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             global_sample_stride=global_sample_stride,
             sample_index_stride=sample_index_stride,
             image_obs_indices=image_obs_indices,
-            profile_getitem=effective_profile_getitem,
-            hetero_bridge=OmegaConf.to_container(hetero_bridge, resolve=True) if isinstance(hetero_bridge, DictConfig) else hetero_bridge,
-            lerobot_meta_cache=lerobot_meta_cache,
-            arrow_cache_dir=arrow_cache_dir,
-            lerobot_backend=lerobot_backend,
-            lerobot_v3_init_num_workers=lerobot_v3_init_num_workers,
-            lerobot_v3_index_cache=lerobot_v3_index_cache,
-            lerobot_tolerance_s=lerobot_tolerance_s,
+            profile_getitem=profile_getitem,
             episode_index_filter=OmegaConf.to_container(episode_index_filter, resolve=True) if isinstance(episode_index_filter, DictConfig) else episode_index_filter,
         )
     
@@ -121,7 +102,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.qwen_context_len = int(qwen_context_len)
         self.qwen_text_cache_format = str(qwen_text_cache_format)
         self.endpoint_frames_only = bool(endpoint_frames_only)
-        self.profile_getitem = effective_profile_getitem
+        self.profile_getitem = bool(profile_getitem)
         augmentation_cfg = video_augmentation if video_augmentation is not None else condition_frame_augmentation
         if augmentation_cfg is not None and is_training_set:
             # Hydra's instantiate(..., recursive=True) may have already built nested
@@ -439,7 +420,6 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         return context, context_mask
 
     def __getitem__(self, idx):
-        t0 = time.perf_counter()
         try:
             data = self._get(idx)
         except Exception as e:
@@ -447,41 +427,6 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             print(traceback.format_exc())
             random_idx = np.random.randint(len(self))
             data = self._get(random_idx)
-        elapsed = time.perf_counter() - t0
-        if self.slow_getitem_log_sec > 0.0 and elapsed >= self.slow_getitem_log_sec:
-            profile = data.get("_profile", {})
-            slow_parts = []
-            if isinstance(profile, dict):
-                time_profile = []
-                counter_profile = []
-                for key, value in profile.items():
-                    if not isinstance(value, (int, float)):
-                        continue
-                    row = (key, float(value))
-                    if (
-                        key.endswith(".calls")
-                        or key.endswith(".requested_frames")
-                        or key.endswith(".frame_span")
-                        or key.endswith(".max_frame_index")
-                        or key.endswith(".frame_span_per_call_max")
-                        or key.endswith(".max_frame_index_per_call_max")
-                        or key.endswith(".frames_decoded")
-                        or key.endswith(".pyav_eof_fallbacks")
-                    ):
-                        counter_profile.append(row)
-                    else:
-                        time_profile.append(row)
-                for key, value in sorted(time_profile, key=lambda item: item[1], reverse=True)[:12]:
-                    slow_parts.append(f"{key}={value:.3f}s")
-                remaining = max(0, 12 - len(slow_parts))
-                for key, value in sorted(counter_profile, key=lambda item: item[1], reverse=True)[:remaining]:
-                    slow_parts.append(f"{key}={value:.1f}")
-            logger.warning(
-                "[slow-getitem] idx=%s elapsed=%.3fs %s",
-                idx,
-                elapsed,
-                " | ".join(slow_parts),
-            )
         # Force glibc to return free pages periodically (no-op when disabled).
         self._mem_trim.tick()
         return data
