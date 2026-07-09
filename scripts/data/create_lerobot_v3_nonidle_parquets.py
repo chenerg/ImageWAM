@@ -1,0 +1,444 @@
+#!/usr/bin/env python3
+"""Create LeRobot v3 non-idle parquet subsets in-place beside the source data.
+
+The source dataset is not modified. For a dataset root like:
+
+    data/chunk-000/file-000.parquet
+    meta/episodes/chunk-000/file-000.parquet
+
+this script writes:
+
+    data_nonidle/chunk-000/file-000.parquet
+    meta_nonidle/episodes/chunk-000/file-000.parquet
+
+Each output data parquet is a row subset of the corresponding source parquet,
+with the ``index`` column rebuilt globally from zero. Episode metadata parquet
+files preserve their original row/file partitioning, while ``length``,
+``dataset_from_index``, and ``dataset_to_index`` are recomputed from the
+filtered data rows.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import sys
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from compute_robotwin_v3_nonidle_ranges import (  # noqa: E402
+    IdleThresholds,
+    _compute_keep_ranges,
+    _data_file_path,
+    _idle_mask,
+    _load_data_file_columns,
+    _read_info,
+    _to_int,
+)
+
+
+@dataclass(frozen=True)
+class EpisodeSpec:
+    episode_index: int
+    dataset_from_index: int
+    dataset_to_index: int
+    data_chunk_index: int
+    data_file_index: int
+    meta_path: Path
+
+    @property
+    def length(self) -> int:
+        return self.dataset_to_index - self.dataset_from_index
+
+    @property
+    def data_file_key(self) -> tuple[int, int]:
+        return self.data_chunk_index, self.data_file_index
+
+
+@dataclass(frozen=True)
+class EpisodePlan:
+    spec: EpisodeSpec
+    keep_ranges: list[list[int]]
+    keep_positions: np.ndarray
+
+    @property
+    def kept_frames(self) -> int:
+        return int(self.keep_positions.shape[0])
+
+
+def _load_episode_specs(dataset_dir: Path) -> list[EpisodeSpec]:
+    import pyarrow.parquet as pq
+
+    episode_paths = sorted((dataset_dir / "meta" / "episodes").glob("chunk-*/file-*.parquet"))
+    if not episode_paths:
+        raise FileNotFoundError(f"No LeRobot v3 episode metadata parquet files found under {dataset_dir}")
+
+    specs: list[EpisodeSpec] = []
+    for meta_path in episode_paths:
+        for row in pq.read_table(meta_path).to_pylist():
+            specs.append(
+                EpisodeSpec(
+                    episode_index=_to_int(row["episode_index"]),
+                    dataset_from_index=_to_int(row["dataset_from_index"]),
+                    dataset_to_index=_to_int(row["dataset_to_index"]),
+                    data_chunk_index=_to_int(row["data/chunk_index"]),
+                    data_file_index=_to_int(row["data/file_index"]),
+                    meta_path=meta_path,
+                )
+            )
+    return sorted(specs, key=lambda item: item.episode_index)
+
+
+def _episode_row_positions(
+    spec: EpisodeSpec,
+    *,
+    file_start_index: int,
+    indices: np.ndarray | None,
+    row_count: int,
+) -> np.ndarray:
+    if indices is None:
+        start = spec.dataset_from_index - file_start_index
+        end = spec.dataset_to_index - file_start_index
+        if start < 0 or end > row_count or start > end:
+            raise ValueError(
+                f"Episode {spec.episode_index} range [{spec.dataset_from_index}, {spec.dataset_to_index}) "
+                f"is outside its data file rows."
+            )
+        positions = np.arange(start, end, dtype=np.int64)
+    else:
+        positions = np.flatnonzero(
+            (indices >= spec.dataset_from_index) & (indices < spec.dataset_to_index)
+        ).astype(np.int64, copy=False)
+
+    if int(positions.shape[0]) != spec.length:
+        raise ValueError(
+            f"Episode {spec.episode_index} expected {spec.length} rows, found {positions.shape[0]} "
+            f"for data file chunk={spec.data_chunk_index} file={spec.data_file_index}"
+        )
+    return positions
+
+
+def _positions_from_ranges(episode_positions: np.ndarray, keep_ranges: list[list[int]]) -> np.ndarray:
+    if not keep_ranges:
+        return np.empty((0,), dtype=np.int64)
+    chunks = [episode_positions[start:end] for start, end in keep_ranges]
+    return np.concatenate(chunks).astype(np.int64, copy=False)
+
+
+def _compute_episode_plans(
+    dataset_dir: Path,
+    info: dict[str, Any],
+    specs: list[EpisodeSpec],
+    thresholds: IdleThresholds,
+    *,
+    progress_every: int,
+) -> dict[int, EpisodePlan]:
+    specs_by_file: dict[tuple[int, int], list[EpisodeSpec]] = defaultdict(list)
+    for spec in specs:
+        specs_by_file[spec.data_file_key].append(spec)
+
+    plans: dict[int, EpisodePlan] = {}
+    processed = 0
+    for chunk_index, file_index in sorted(specs_by_file):
+        data_path = _data_file_path(dataset_dir, info, chunk_index, file_index)
+        indices, action, state = _load_data_file_columns(data_path)
+        file_specs = sorted(specs_by_file[(chunk_index, file_index)], key=lambda item: item.episode_index)
+        file_start_index = min(spec.dataset_from_index for spec in file_specs)
+
+        for spec in file_specs:
+            positions = _episode_row_positions(
+                spec,
+                file_start_index=file_start_index,
+                indices=indices,
+                row_count=int(action.shape[0]),
+            )
+            ep_action = action[positions]
+            ep_state = state[positions]
+            idle = _idle_mask(
+                ep_action,
+                ep_state,
+                idle_l2_threshold=thresholds.idle_l2_threshold,
+                idle_arm_l2_threshold=thresholds.idle_arm_l2_threshold,
+                idle_gripper_l2_threshold=thresholds.idle_gripper_l2_threshold,
+            )
+            keep_ranges = _compute_keep_ranges(
+                idle,
+                min_idle_len=thresholds.min_idle_len,
+                min_non_idle_len=thresholds.min_non_idle_len,
+            )
+            plans[spec.episode_index] = EpisodePlan(
+                spec=spec,
+                keep_ranges=keep_ranges,
+                keep_positions=_positions_from_ranges(positions, keep_ranges),
+            )
+            processed += 1
+            if progress_every > 0 and processed % progress_every == 0:
+                print(f"computed non-idle ranges for {processed}/{len(specs)} episodes...", flush=True)
+    return plans
+
+
+def _prepare_output_dir(path: Path, overwrite: bool) -> None:
+    if not path.exists():
+        return
+    if not overwrite:
+        raise FileExistsError(f"Output directory already exists: {path}. Pass --overwrite to replace it.")
+    shutil.rmtree(path)
+
+
+def _relative_data_output_path(dataset_dir: Path, data_path: Path, data_output_dir: Path) -> Path:
+    try:
+        rel = data_path.relative_to(dataset_dir / "data")
+    except ValueError as exc:
+        raise ValueError(f"Data path is not under {dataset_dir / 'data'}: {data_path}") from exc
+    return data_output_dir / rel
+
+
+def _replace_int_column(table: Any, name: str, values: list[int] | range) -> Any:
+    import pyarrow as pa
+
+    column_index = table.schema.get_field_index(name)
+    if column_index < 0:
+        raise KeyError(f"Required column {name!r} not found in parquet schema: {table.schema.names}")
+    field = table.schema.field(column_index)
+    array = pa.array(list(values), type=field.type)
+    return table.set_column(column_index, field, array)
+
+
+def _write_data_nonidle(
+    dataset_dir: Path,
+    info: dict[str, Any],
+    specs: list[EpisodeSpec],
+    plans: dict[int, EpisodePlan],
+    *,
+    data_output_dir: Path,
+) -> dict[int, list[int]]:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    specs_by_file: dict[tuple[int, int], list[EpisodeSpec]] = defaultdict(list)
+    for spec in specs:
+        specs_by_file[spec.data_file_key].append(spec)
+
+    output_indices_by_episode: dict[int, list[int]] = {spec.episode_index: [] for spec in specs}
+    next_output_index = 0
+
+    for chunk_index, file_index in sorted(specs_by_file):
+        data_path = _data_file_path(dataset_dir, info, chunk_index, file_index)
+        table = pq.read_table(data_path)
+        position_to_episode: dict[int, int] = {}
+        keep_positions: list[int] = []
+        for spec in specs_by_file[(chunk_index, file_index)]:
+            for pos in plans[spec.episode_index].keep_positions.tolist():
+                pos_i = int(pos)
+                if pos_i in position_to_episode:
+                    raise ValueError(f"Duplicate kept row position {pos_i} in {data_path}")
+                position_to_episode[pos_i] = spec.episode_index
+                keep_positions.append(pos_i)
+
+        keep_positions = sorted(keep_positions)
+        out_table = table.take(pa.array(keep_positions, type=pa.int64()))
+        new_indices = range(next_output_index, next_output_index + len(keep_positions))
+        out_table = _replace_int_column(out_table, "index", new_indices)
+
+        for new_index, source_pos in enumerate(keep_positions, start=next_output_index):
+            output_indices_by_episode[position_to_episode[source_pos]].append(new_index)
+        next_output_index += len(keep_positions)
+
+        out_path = _relative_data_output_path(dataset_dir, data_path, data_output_dir)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(out_table, out_path)
+
+    return output_indices_by_episode
+
+
+def _episode_intervals_from_output_indices(
+    specs: list[EpisodeSpec],
+    output_indices_by_episode: dict[int, list[int]],
+) -> dict[int, tuple[int, int, int]]:
+    intervals: dict[int, tuple[int, int, int]] = {}
+    expected_next = 0
+    for spec in sorted(specs, key=lambda item: item.episode_index):
+        indices = output_indices_by_episode.get(spec.episode_index, [])
+        if not indices:
+            intervals[spec.episode_index] = (0, expected_next, expected_next)
+            continue
+        expected = list(range(expected_next, expected_next + len(indices)))
+        if indices != expected:
+            raise ValueError(
+                f"Filtered rows for episode {spec.episode_index} are not contiguous in output index order: "
+                f"expected {expected[:3]}... got {indices[:3]}..."
+            )
+        start = expected_next
+        stop = expected_next + len(indices)
+        intervals[spec.episode_index] = (len(indices), start, stop)
+        expected_next = stop
+    return intervals
+
+
+def _write_meta_nonidle(
+    dataset_dir: Path,
+    specs: list[EpisodeSpec],
+    intervals: dict[int, tuple[int, int, int]],
+    *,
+    meta_output_dir: Path,
+) -> None:
+    import pyarrow.parquet as pq
+
+    meta_paths = sorted({spec.meta_path for spec in specs})
+    for meta_path in meta_paths:
+        table = pq.read_table(meta_path)
+        rows = table.to_pylist()
+        lengths: list[int] = []
+        from_indices: list[int] = []
+        to_indices: list[int] = []
+        for row in rows:
+            episode_index = _to_int(row["episode_index"])
+            length, start, stop = intervals[episode_index]
+            lengths.append(length)
+            from_indices.append(start)
+            to_indices.append(stop)
+
+        table = _replace_int_column(table, "length", lengths)
+        table = _replace_int_column(table, "dataset_from_index", from_indices)
+        table = _replace_int_column(table, "dataset_to_index", to_indices)
+
+        rel = meta_path.relative_to(dataset_dir / "meta")
+        out_path = meta_output_dir / rel
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(table, out_path)
+
+
+def create_nonidle_parquets(
+    dataset_dir: Path,
+    *,
+    data_output_dir: Path | None = None,
+    meta_output_dir: Path | None = None,
+    thresholds: IdleThresholds,
+    overwrite: bool = False,
+    report_path: Path | None = None,
+    progress_every: int = 100,
+) -> dict[str, Any]:
+    dataset_dir = dataset_dir.expanduser().resolve()
+    data_output_dir = (data_output_dir or dataset_dir / "data_nonidle").expanduser().resolve()
+    meta_output_dir = (meta_output_dir or dataset_dir / "meta_nonidle").expanduser().resolve()
+    report_path = (report_path or dataset_dir / "nonidle_parquet_report.json").expanduser().resolve()
+
+    info = _read_info(dataset_dir)
+    specs = _load_episode_specs(dataset_dir)
+    if not specs:
+        raise FileNotFoundError(f"No LeRobot v3 episodes found under {dataset_dir}")
+
+    _prepare_output_dir(data_output_dir, overwrite)
+    _prepare_output_dir(meta_output_dir, overwrite)
+
+    plans = _compute_episode_plans(
+        dataset_dir,
+        info,
+        specs,
+        thresholds,
+        progress_every=progress_every,
+    )
+    output_indices_by_episode = _write_data_nonidle(
+        dataset_dir,
+        info,
+        specs,
+        plans,
+        data_output_dir=data_output_dir,
+    )
+    intervals = _episode_intervals_from_output_indices(specs, output_indices_by_episode)
+    _write_meta_nonidle(dataset_dir, specs, intervals, meta_output_dir=meta_output_dir)
+
+    total_frames = sum(spec.length for spec in specs)
+    kept_frames = sum(plan.kept_frames for plan in plans.values())
+    report = {
+        "format": "imagewam_lerobot_v3_nonidle_parquet_subset_v1",
+        "dataset_dir": str(dataset_dir),
+        "data_output_dir": str(data_output_dir),
+        "meta_output_dir": str(meta_output_dir),
+        "thresholds": {
+            "idle_l2_threshold": thresholds.idle_l2_threshold,
+            "idle_arm_l2_threshold": thresholds.idle_arm_l2_threshold,
+            "idle_gripper_l2_threshold": thresholds.idle_gripper_l2_threshold,
+            "min_idle_len": thresholds.min_idle_len,
+            "min_non_idle_len": thresholds.min_non_idle_len,
+        },
+        "summary": {
+            "episodes": len(specs),
+            "data_files": len({spec.data_file_key for spec in specs}),
+            "total_frames": total_frames,
+            "kept_frames": kept_frames,
+            "removed_frames": total_frames - kept_frames,
+            "kept_rate": kept_frames / max(total_frames, 1),
+        },
+        "episodes": [
+            {
+                "episode_index": spec.episode_index,
+                "source_length": spec.length,
+                "kept_frames": plans[spec.episode_index].kept_frames,
+                "keep_ranges": plans[spec.episode_index].keep_ranges,
+                "dataset_from_index": intervals[spec.episode_index][1],
+                "dataset_to_index": intervals[spec.episode_index][2],
+            }
+            for spec in specs
+        ],
+    }
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    print(f"Wrote non-idle data parquet files under: {data_output_dir}")
+    print(f"Wrote non-idle episode metadata under: {meta_output_dir}")
+    print(f"Wrote report: {report_path}")
+    print(
+        f"episodes={len(specs)} total_frames={total_frames} kept_frames={kept_frames} "
+        f"removed_frames={total_frames - kept_frames} kept_rate={report['summary']['kept_rate'] * 100:.2f}%"
+    )
+    return report
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("dataset_dir", type=Path)
+    parser.add_argument("--data-output-dir", type=Path, default=None)
+    parser.add_argument("--meta-output-dir", type=Path, default=None)
+    parser.add_argument("--report-path", type=Path, default=None)
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--idle-l2-threshold", type=float, default=1e-3)
+    parser.add_argument("--idle-arm-l2-threshold", type=float, default=1e-3)
+    parser.add_argument("--idle-gripper-l2-threshold", type=float, default=1e-3)
+    parser.add_argument("--min-idle-len", type=int, default=5)
+    parser.add_argument("--min-non-idle-len", type=int, default=1)
+    parser.add_argument("--progress-every", type=int, default=100)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    create_nonidle_parquets(
+        args.dataset_dir,
+        data_output_dir=args.data_output_dir,
+        meta_output_dir=args.meta_output_dir,
+        report_path=args.report_path,
+        overwrite=args.overwrite,
+        thresholds=IdleThresholds(
+            idle_l2_threshold=args.idle_l2_threshold,
+            idle_arm_l2_threshold=args.idle_arm_l2_threshold,
+            idle_gripper_l2_threshold=args.idle_gripper_l2_threshold,
+            min_idle_len=args.min_idle_len,
+            min_non_idle_len=args.min_non_idle_len,
+        ),
+        progress_every=args.progress_every,
+    )
+
+
+if __name__ == "__main__":
+    main()

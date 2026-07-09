@@ -226,6 +226,43 @@ nonidle_filter_path: ${data.robotwin_root}/nonidle_ranges.json
 
 如果使用的是旧的按 episode 存储的 LeRobot 布局，请改用 `scripts/data/compute_robotwin_nonidle_ranges.py`。上面的 v3 脚本适用于 LeRobot v3 的 chunk/file 布局。
 
+如果只需要为 LeRobot v3 chunk/file 布局物理生成 non-idle parquet，而不重写视频，可以运行：
+
+```bash
+python scripts/data/create_lerobot_v3_nonidle_parquets.py \
+  data/robotwin2.0/robotwin2.0
+```
+
+默认会在原数据集旁边写出过滤后的帧数据和匹配的 episode metadata：
+
+```text
+data/robotwin2.0/robotwin2.0/
+├── data_nonidle/
+├── meta_nonidle/
+└── nonidle_parquet_report.json
+```
+
+原始的 `data/` 和 `meta/` 目录不会被修改。输出的 data parquet 会把全局 `index` 从 0 重新连续编号；`frame_index` 保留原 episode 内的帧号，方便回溯到源 episode 时间线。输出的 `meta_nonidle/episodes` 会同步更新 `length`、`dataset_from_index` 和 `dataset_to_index`，使其与过滤后的帧行一致。
+
+常用参数：
+
+```bash
+# 覆盖已有的 data_nonidle/ 和 meta_nonidle/ 输出。
+--overwrite
+
+# 自定义输出位置。
+--data-output-dir /path/to/data_nonidle
+--meta-output-dir /path/to/meta_nonidle
+--report-path /path/to/nonidle_parquet_report.json
+
+# 调整 idle 检测阈值。
+--idle-l2-threshold 1e-3
+--idle-arm-l2-threshold 1e-3
+--idle-gripper-l2-threshold 1e-3
+--min-idle-len 5
+--min-non-idle-len 1
+```
+
 只有在确实需要一个已经物理删除 idle 帧的新 LeRobot v3 数据集目录，并同时裁剪 parquet data 和 videos 时，才需要运行：
 
 ```bash

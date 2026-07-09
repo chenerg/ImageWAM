@@ -227,6 +227,43 @@ nonidle_filter_path: ${data.robotwin_root}/nonidle_ranges.json
 
 If you use the older per-episode LeRobot layout, run `scripts/data/compute_robotwin_nonidle_ranges.py` instead. The v3 script above is for the chunk/file layout used by LeRobot v3.
 
+If you only need physical non-idle parquet files for the LeRobot v3 chunk/file layout, without rewriting videos, run:
+
+```bash
+python scripts/data/create_lerobot_v3_nonidle_parquets.py \
+  data/robotwin2.0/robotwin2.0
+```
+
+By default this writes the filtered frame rows and matching episode metadata beside the source dataset:
+
+```text
+data/robotwin2.0/robotwin2.0/
+├── data_nonidle/
+├── meta_nonidle/
+└── nonidle_parquet_report.json
+```
+
+The source `data/` and `meta/` directories are left unchanged. The output data parquet files rebuild the global `index` column from zero, while `frame_index` remains the original per-episode frame index so retained frames can still be traced back to the source episode timeline. The output `meta_nonidle/episodes` files update `length`, `dataset_from_index`, and `dataset_to_index` to match the filtered rows.
+
+Useful options:
+
+```bash
+# Replace existing data_nonidle/ and meta_nonidle/ outputs.
+--overwrite
+
+# Write outputs somewhere else.
+--data-output-dir /path/to/data_nonidle
+--meta-output-dir /path/to/meta_nonidle
+--report-path /path/to/nonidle_parquet_report.json
+
+# Tune idle detection thresholds.
+--idle-l2-threshold 1e-3
+--idle-arm-l2-threshold 1e-3
+--idle-gripper-l2-threshold 1e-3
+--min-idle-len 5
+--min-non-idle-len 1
+```
+
 Only if you specifically need a new LeRobot v3 dataset directory with idle frames physically removed from both parquet data and videos, run:
 
 ```bash
