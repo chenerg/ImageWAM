@@ -208,24 +208,7 @@ The default RoboTwin training configs already point to this layout. If your data
 data_root: ./data/robotwin2.0
 robotwin_root: ${data.data_root}/robotwin2.0
 qwen_cache_dir: ${data.robotwin_root}/qwen_cache
-nonidle_filter_path: ${data.robotwin_root}/nonidle_ranges.json
 ```
-
-To filter no-op frames in RoboTwin, the default workflow is to generate a non-idle JSON file and let the dataloader apply it at training time. This does not rewrite parquet files or videos, so it is much faster than creating a new dataset directory.
-
-```bash
-python scripts/data/compute_robotwin_v3_nonidle_ranges.py \
-  data/robotwin2.0/robotwin2.0 \
-  --output data/robotwin2.0/robotwin2.0/nonidle_ranges.json
-```
-
-The default RoboTwin configs read this file through `nonidle_filter_path`, so training can keep using the original dataset root:
-
-```yaml
-nonidle_filter_path: ${data.robotwin_root}/nonidle_ranges.json
-```
-
-If you use the older per-episode LeRobot layout, run `scripts/data/compute_robotwin_nonidle_ranges.py` instead. The v3 script above is for the chunk/file layout used by LeRobot v3.
 
 If you only need physical non-idle parquet files for the LeRobot v3 chunk/file layout, without rewriting videos, run:
 
@@ -255,41 +238,6 @@ Useful options:
 --data-output-dir /path/to/data_nonidle
 --meta-output-dir /path/to/meta_nonidle
 --report-path /path/to/nonidle_parquet_report.json
-
-# Tune idle detection thresholds.
---idle-l2-threshold 1e-3
---idle-arm-l2-threshold 1e-3
---idle-gripper-l2-threshold 1e-3
---min-idle-len 5
---min-non-idle-len 1
-```
-
-Only if you specifically need a new LeRobot v3 dataset directory with idle frames physically removed from both parquet data and videos, run:
-
-```bash
-python scripts/data/materialize_lerobot_v3_nonidle.py \
-  data/robotwin2.0/robotwin2.0 \
-  data/robotwin2.0/robotwin2.0_nonidle \
-  --video-backend pyav
-```
-
-This command is optional and much slower because it writes a fresh output dataset and re-encodes videos. It leaves the input dataset unchanged. Episode indices, frame indices, timestamps, and global frame indices are rebuilt from zero in the output dataset. The script prints progress for range computation and kept-frame writing, and writes a summary to:
-
-```text
-data/robotwin2.0/robotwin2.0_nonidle/nonidle_materialize_report.json
-```
-
-Useful options:
-
-```bash
-# Replace an existing output directory.
---overwrite
-
-# Process only the first N episodes for a quick smoke test.
---max-episodes N
-
-# Disable progress bars in log-only environments.
---no-progress
 
 # Tune idle detection thresholds.
 --idle-l2-threshold 1e-3

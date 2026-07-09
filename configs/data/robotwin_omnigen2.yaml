@@ -1,7 +1,6 @@
 data_root: ./data/robotwin2.0
 robotwin_root: ${data.data_root}/robotwin2.0
 qwen_cache_dir: ${data.robotwin_root}/qwen_cache
-nonidle_filter_path: ${data.robotwin_root}/nonidle_ranges.json
 
 train:
   _target_: imagewam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
@@ -58,7 +57,6 @@ train:
       fill: mean
   require_text_cache: false
   endpoint_frames_only: true
-  nonidle_filter_path: ${data.nonidle_filter_path}
   qwen_text_cache_dir: ${data.qwen_cache_dir}
   qwen_context_len: 128
   processor:
@@ -129,7 +127,6 @@ val:
   video_augmentation: null
   require_text_cache: false
   endpoint_frames_only: true
-  nonidle_filter_path: ${data.nonidle_filter_path}
   qwen_text_cache_dir: ${data.qwen_cache_dir}
   qwen_context_len: 128
   processor:

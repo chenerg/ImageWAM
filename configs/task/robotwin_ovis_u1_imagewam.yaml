@@ -10,7 +10,6 @@ data:
     qwen_text_cache_dir: null
     require_text_cache: false
   val:
-    nonidle_filter_path: null
     qwen_text_cache_dir: null
     require_text_cache: false
 

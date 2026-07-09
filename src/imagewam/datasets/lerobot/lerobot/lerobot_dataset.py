@@ -14,7 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
-import json
 import logging
 import os
 import shutil
@@ -642,7 +641,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
         video_backend: str | None = None,
         video_codec: Literal["h264", "hevc", "libsvtav1", "h264_nvenc"] = "libsvtav1", 
         is_compute_episode_stats_image: bool = True,
-        nonidle_filter_path: str | Path | None = None,
         load_stats_metadata: bool = True,
         cached_metadata: dict[str, Any] | None = None,
         hf_dataset_cache_dir: str | Path | None = None,
@@ -790,10 +788,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.is_compute_episode_stats_image = is_compute_episode_stats_image
         self.delta_indices = None
         self.during_training = True
-        self.nonidle_filter_path = None if nonidle_filter_path is None else Path(nonidle_filter_path).expanduser()
-        self._nonidle_filtered_indices: list[int] | None = None
-        self._nonidle_keep_indices_by_episode_pos: list[list[int]] | None = None
-        self._nonidle_raw_index_to_keep_rank: dict[int, int] | None = None
 
         # Unused attributes
         self.image_writer = None
@@ -855,8 +849,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
             list(self.episodes) if self.episodes is not None else sorted(self.meta.episodes)
         )
         _mark("episode_data_index", episodes=len(self._selected_episode_indices))
-        self._load_nonidle_filter()
-        _mark("nonidle_filter")
 
         # Disabled by default: this reads full Arrow columns for every root at
         # dataset construction time. Enable only when validating a new dataset.
@@ -875,59 +867,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
             self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
         _mark("delta_indices")
         _mark("total")
-
-    def _load_nonidle_filter(self) -> None:
-        if self.nonidle_filter_path is None:
-            return
-        if not self.nonidle_filter_path.exists():
-            raise FileNotFoundError(f"Non-idle filter JSON not found: {self.nonidle_filter_path}")
-
-        payload = json.loads(self.nonidle_filter_path.read_text(encoding="utf-8"))
-        if isinstance(payload, dict) and "episodes" in payload:
-            episode_ranges = payload["episodes"]
-        else:
-            episode_ranges = payload
-        if not isinstance(episode_ranges, dict):
-            raise ValueError(
-                f"Non-idle filter JSON must contain an episode range mapping, got {type(episode_ranges)}"
-            )
-
-        filtered_indices: list[int] = []
-        keep_by_episode_pos: list[list[int]] = []
-        raw_to_rank: dict[int, int] = {}
-
-        for episode_pos, episode_idx in enumerate(self._selected_episode_indices):
-            ep_start = int(self.episode_data_index["from"][episode_pos].item())
-            ep_end = int(self.episode_data_index["to"][episode_pos].item())
-            ranges = episode_ranges.get(str(episode_idx), episode_ranges.get(int(episode_idx), None))
-            if ranges is None:
-                keep_indices = list(range(ep_start, ep_end))
-            else:
-                keep_indices = []
-                for raw_start, raw_end in ranges:
-                    start = max(0, int(raw_start))
-                    end = min(ep_end - ep_start, int(raw_end))
-                    if end <= start:
-                        continue
-                    keep_indices.extend(range(ep_start + start, ep_start + end))
-            keep_indices = sorted(set(keep_indices))
-            keep_by_episode_pos.append(keep_indices)
-            for keep_rank, raw_idx in enumerate(keep_indices):
-                raw_to_rank[int(raw_idx)] = keep_rank
-            filtered_indices.extend(keep_indices)
-
-        if len(filtered_indices) == 0:
-            raise ValueError(f"Non-idle filter removed all frames: {self.nonidle_filter_path}")
-
-        self._nonidle_filtered_indices = filtered_indices
-        self._nonidle_keep_indices_by_episode_pos = keep_by_episode_pos
-        self._nonidle_raw_index_to_keep_rank = raw_to_rank
-        logging.info(
-            "Loaded non-idle filter %s: kept %d/%d frames.",
-            self.nonidle_filter_path,
-            len(filtered_indices),
-            len(self.hf_dataset),
-        )
 
     def push_to_hub(
         self,
@@ -1084,8 +1023,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
     @property
     def num_frames(self) -> int:
         """Number of frames in selected episodes."""
-        if self._nonidle_filtered_indices is not None:
-            return len(self._nonidle_filtered_indices)
         return len(self.hf_dataset) if self.hf_dataset is not None else self.meta.total_frames
 
     @property
@@ -1106,30 +1043,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
             return get_hf_features_from_features(self.features)
 
     def _get_query_indices(self, idx: int, ep_idx: int) -> tuple[dict[str, list[int | bool]]]:
-        if self._nonidle_filtered_indices is not None:
-            if self._nonidle_keep_indices_by_episode_pos is None or self._nonidle_raw_index_to_keep_rank is None:
-                raise RuntimeError("Non-idle filter index tables are not initialized.")
-            keep_indices = self._nonidle_keep_indices_by_episode_pos[ep_idx]
-            if len(keep_indices) == 0:
-                raise IndexError(f"Episode position {ep_idx} has no non-idle frames.")
-            if idx not in self._nonidle_raw_index_to_keep_rank:
-                raise IndexError(f"Raw index {idx} is not in the non-idle filter.")
-            keep_rank = self._nonidle_raw_index_to_keep_rank[idx]
-            query_indices = {}
-            padding = {}
-            for key, delta_idx in self.delta_indices.items():
-                cur_indices = []
-                cur_padding = []
-                for delta in delta_idx:
-                    target_rank = keep_rank + int(delta)
-                    is_pad = target_rank < 0 or target_rank >= len(keep_indices)
-                    clamped_rank = max(0, min(len(keep_indices) - 1, target_rank))
-                    cur_indices.append(int(keep_indices[clamped_rank]))
-                    cur_padding.append(bool(is_pad))
-                query_indices[key] = cur_indices
-                padding[f"{key}_is_pad"] = torch.BoolTensor(cur_padding)
-            return query_indices, padding
-
         ep_start = self.episode_data_index["from"][ep_idx]
         ep_end = self.episode_data_index["to"][ep_idx]
         query_indices = {
@@ -1257,9 +1170,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         profile_on = profile is not None
         _t0 = time.perf_counter() if profile_on else 0.0
 
-        raw_idx = int(self._nonidle_filtered_indices[idx]) if self._nonidle_filtered_indices is not None else idx
-
-        item = self.hf_dataset[raw_idx]
+        item = self.hf_dataset[idx]
         if profile_on:
             _t1 = time.perf_counter()
             _profile_add("lerobot.hf_row", _t1 - _t0)
@@ -1271,7 +1182,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             current_ep_idx = (
                 self._episodes_to_pos[ep_idx] if self._episodes_to_pos is not None else ep_idx
             )
-            query_indices, padding = self._get_query_indices(raw_idx, current_ep_idx)
+            query_indices, padding = self._get_query_indices(idx, current_ep_idx)
             if profile_on:
                 _t1 = time.perf_counter()
                 _profile_add("lerobot.query_indices", _t1 - _t0)
@@ -1287,7 +1198,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         if len(self.meta.video_keys) > 0 and self.during_training:
             current_ts = item["timestamp"].item()
-            query_timestamps = self._get_query_timestamps(current_ts, query_indices, idx=raw_idx)
+            query_timestamps = self._get_query_timestamps(current_ts, query_indices, idx=idx)
             if profile_on:
                 _t1 = time.perf_counter()
                 _profile_add("lerobot.query_ts", _t1 - _t0)
@@ -1629,7 +1540,6 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         tolerances_s: dict | None = None,
         download_videos: bool = True,
         video_backend: str | None = None,
-        nonidle_filter_path: str | Path | None = None,
         hetero_bridge: dict | None = None,
         lerobot_meta_cache: dict[str, dict[str, Any]] | None = None,
         hf_dataset_cache_dir: str | Path | None = None,
@@ -1661,7 +1571,6 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
                     tolerance_s=self.tolerances_s[ds_name],
                     download_videos=download_videos,
                     video_backend=video_backend,
-                    nonidle_filter_path=nonidle_filter_path,
                     load_stats_metadata=self.hetero_bridge is None,
                     cached_metadata=(
                         lerobot_meta_cache.get(str(ds_root.expanduser().resolve()))

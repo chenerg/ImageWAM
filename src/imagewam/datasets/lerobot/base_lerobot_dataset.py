@@ -108,7 +108,6 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         global_sample_stride: int = 1,
         sample_index_stride: int = 1,
         image_obs_indices: Optional[List[int]] = None,
-        nonidle_filter_path: Optional[str] = None,
         profile_getitem: bool = False,
         hetero_bridge: Optional[Dict[str, Any]] = None,
         lerobot_meta_cache: Optional[str] = None,
@@ -262,13 +261,10 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             "delta_timestamps": delta_timestamps,
         }
         if self.lerobot_backend == "v2":
-            dataset_kwargs["nonidle_filter_path"] = nonidle_filter_path
             dataset_kwargs["hetero_bridge"] = hetero_bridge
             dataset_kwargs["lerobot_meta_cache"] = meta_cache_by_root if meta_cache_by_root else None
             dataset_kwargs["hf_dataset_cache_dir"] = arrow_cache_dir
         else:
-            if nonidle_filter_path is not None:
-                logger.warning("lerobot_backend='v3' now uses lerobot_v4 and ignores nonidle_filter_path.")
             if hetero_bridge is not None:
                 logger.warning("lerobot_backend='v3' now uses lerobot_v4 and ignores hetero_bridge.")
             if int(lerobot_v3_init_num_workers) != 1:

@@ -207,24 +207,7 @@ data/robotwin2.0/
 data_root: ./data/robotwin2.0
 robotwin_root: ${data.data_root}/robotwin2.0
 qwen_cache_dir: ${data.robotwin_root}/qwen_cache
-nonidle_filter_path: ${data.robotwin_root}/nonidle_ranges.json
 ```
-
-为了过滤 RoboTwin 中的 no-op 帧，默认流程是先生成 non-idle JSON，然后在训练时由 dataloader 根据 `nonidle_filter_path` 过滤采样。这个方式不会重写 parquet 或视频文件，比创建新的数据集目录快很多。
-
-```bash
-python scripts/data/compute_robotwin_v3_nonidle_ranges.py \
-  data/robotwin2.0/robotwin2.0 \
-  --output data/robotwin2.0/robotwin2.0/nonidle_ranges.json
-```
-
-默认 RoboTwin 配置会通过 `nonidle_filter_path` 读取这个文件，因此训练时仍然使用原始数据集目录：
-
-```yaml
-nonidle_filter_path: ${data.robotwin_root}/nonidle_ranges.json
-```
-
-如果使用的是旧的按 episode 存储的 LeRobot 布局，请改用 `scripts/data/compute_robotwin_nonidle_ranges.py`。上面的 v3 脚本适用于 LeRobot v3 的 chunk/file 布局。
 
 如果只需要为 LeRobot v3 chunk/file 布局物理生成 non-idle parquet，而不重写视频，可以运行：
 
@@ -254,41 +237,6 @@ data/robotwin2.0/robotwin2.0/
 --data-output-dir /path/to/data_nonidle
 --meta-output-dir /path/to/meta_nonidle
 --report-path /path/to/nonidle_parquet_report.json
-
-# 调整 idle 检测阈值。
---idle-l2-threshold 1e-3
---idle-arm-l2-threshold 1e-3
---idle-gripper-l2-threshold 1e-3
---min-idle-len 5
---min-non-idle-len 1
-```
-
-只有在确实需要一个已经物理删除 idle 帧的新 LeRobot v3 数据集目录，并同时裁剪 parquet data 和 videos 时，才需要运行：
-
-```bash
-python scripts/data/materialize_lerobot_v3_nonidle.py \
-  data/robotwin2.0/robotwin2.0 \
-  data/robotwin2.0/robotwin2.0_nonidle \
-  --video-backend pyav
-```
-
-这个命令是可选方案，并且会慢很多，因为它会写出新的数据集并重新编码视频。它不会修改输入数据集。输出数据集中的 `episode_index`、`frame_index`、`timestamp` 和全局 `index` 会从 0 重新连续编号。脚本会显示 range 计算和保留帧写入进度，并在输出目录写入汇总报告：
-
-```text
-data/robotwin2.0/robotwin2.0_nonidle/nonidle_materialize_report.json
-```
-
-常用参数：
-
-```bash
-# 覆盖已存在的输出目录。
---overwrite
-
-# 只处理前 N 个 episode，适合先做快速测试。
---max-episodes N
-
-# 在纯日志环境里关闭进度条。
---no-progress
 
 # 调整 idle 检测阈值。
 --idle-l2-threshold 1e-3

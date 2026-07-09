@@ -23,7 +23,6 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
-import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,19 +31,162 @@ from typing import Any
 import numpy as np
 
 
-_SCRIPT_DIR = Path(__file__).resolve().parent
-if str(_SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPT_DIR))
+ACTION_CANDIDATES = ("action", "action.default")
+STATE_CANDIDATES = ("observation.state", "observation.state.default")
+INDEX_CANDIDATES = ("index",)
+DEFAULT_DATA_PATH = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
 
-from compute_robotwin_v3_nonidle_ranges import (  # noqa: E402
-    IdleThresholds,
-    _compute_keep_ranges,
-    _data_file_path,
-    _idle_mask,
-    _load_data_file_columns,
-    _read_info,
-    _to_int,
-)
+
+@dataclass(frozen=True)
+class IdleThresholds:
+    idle_l2_threshold: float
+    idle_arm_l2_threshold: float
+    idle_gripper_l2_threshold: float
+    min_idle_len: int
+    min_non_idle_len: int
+
+
+def _to_scalar(value: Any) -> Any:
+    if hasattr(value, "item"):
+        return value.item()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _to_int(value: Any) -> int:
+    return int(_to_scalar(value))
+
+
+def _select_column(names: list[str], candidates: tuple[str, ...], label: str) -> str:
+    for candidate in candidates:
+        if candidate in names:
+            return candidate
+    raise KeyError(f"Could not find {label} column. Tried {candidates}; available columns: {names}")
+
+
+def _column_to_numpy(table: Any, column_name: str, *, dtype: Any = np.float64) -> np.ndarray:
+    arr = np.asarray(table[column_name].to_pylist(), dtype=dtype)
+    if arr.ndim == 1:
+        arr = arr[:, None]
+    return arr
+
+
+def _index_column_to_numpy(table: Any, column_name: str) -> np.ndarray:
+    return np.asarray([_to_int(value) for value in table[column_name].to_pylist()], dtype=np.int64)
+
+
+def _split_arm_gripper(delta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    if delta.shape[1] >= 14:
+        arm = np.concatenate([delta[:, :6], delta[:, 7:13]], axis=1)
+        gripper = delta[:, [6, 13]]
+        return arm, gripper
+    return delta, np.zeros((delta.shape[0], 0), dtype=delta.dtype)
+
+
+def _idle_mask(
+    action: np.ndarray,
+    state: np.ndarray,
+    *,
+    idle_l2_threshold: float,
+    idle_arm_l2_threshold: float,
+    idle_gripper_l2_threshold: float,
+) -> np.ndarray:
+    delta = action - state
+    target_l2 = np.linalg.norm(delta, axis=1)
+    arm_delta, gripper_delta = _split_arm_gripper(delta)
+    arm_l2 = np.linalg.norm(arm_delta, axis=1)
+    gripper_l2 = np.linalg.norm(gripper_delta, axis=1) if gripper_delta.shape[1] else np.zeros_like(target_l2)
+    return (
+        (target_l2 <= idle_l2_threshold)
+        | (
+            (arm_l2 <= idle_arm_l2_threshold)
+            & (gripper_l2 <= idle_gripper_l2_threshold)
+        )
+    )
+
+
+def _true_spans(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    padded = np.concatenate([[False], mask.astype(bool), [False]])
+    diff = np.diff(padded.astype(np.int8))
+    starts = np.where(diff == 1)[0]
+    ends = np.where(diff == -1)[0]
+    return starts, ends
+
+
+def _compute_keep_ranges(
+    idle: np.ndarray,
+    *,
+    min_idle_len: int,
+    min_non_idle_len: int,
+) -> list[list[int]]:
+    idle_starts, idle_ends = _true_spans(idle)
+    remove_mask = np.zeros(len(idle), dtype=bool)
+    for start, end in zip(idle_starts, idle_ends, strict=True):
+        if int(end) == len(idle):
+            continue
+        if int(end - start) >= min_idle_len:
+            remove_mask[int(start):int(end)] = True
+
+    keep_starts, keep_ends = _true_spans(~remove_mask)
+    ranges: list[list[int]] = []
+    for start, end in zip(keep_starts, keep_ends, strict=True):
+        start_i = int(start)
+        end_i = int(end)
+        if end_i - start_i >= min_non_idle_len:
+            ranges.append([start_i, end_i])
+    return ranges
+
+
+def _read_info(dataset_dir: Path) -> dict[str, Any]:
+    info_path = dataset_dir / "meta" / "info.json"
+    if not info_path.exists():
+        raise FileNotFoundError(f"LeRobot info.json not found: {info_path}")
+    return json.loads(info_path.read_text(encoding="utf-8"))
+
+
+def _data_file_path(dataset_dir: Path, info: dict[str, Any], chunk_index: int, file_index: int) -> Path:
+    data_path = info.get("data_path") or DEFAULT_DATA_PATH
+    if not isinstance(data_path, str):
+        raise ValueError(f"Invalid data_path in info.json: {data_path!r}")
+    try:
+        formatted = data_path.format(
+            chunk_index=chunk_index,
+            file_index=file_index,
+            episode_chunk=chunk_index,
+            episode_index=file_index,
+        )
+    except KeyError as exc:
+        raise ValueError(f"Unsupported LeRobot v3 data_path template: {data_path!r}") from exc
+    return dataset_dir / formatted
+
+
+def _load_data_file_columns(path: Path) -> tuple[np.ndarray | None, np.ndarray, np.ndarray]:
+    import pyarrow.parquet as pq
+
+    if not path.exists():
+        raise FileNotFoundError(f"LeRobot v3 data parquet not found: {path}")
+
+    schema = pq.read_schema(path)
+    names = list(schema.names)
+    action_key = _select_column(names, ACTION_CANDIDATES, "action")
+    state_key = _select_column(names, STATE_CANDIDATES, "state")
+    columns = [action_key, state_key]
+
+    index_key: str | None = None
+    try:
+        index_key = _select_column(names, INDEX_CANDIDATES, "index")
+        columns.insert(0, index_key)
+    except KeyError:
+        pass
+
+    table = pq.read_table(path, columns=columns)
+    indices = _index_column_to_numpy(table, index_key) if index_key is not None else None
+    action = _column_to_numpy(table, action_key)
+    state = _column_to_numpy(table, state_key)
+    if action.shape != state.shape:
+        raise ValueError(f"Action/state shape mismatch in {path}: action={action.shape}, state={state.shape}")
+    return indices, action, state
 
 
 @dataclass(frozen=True)
