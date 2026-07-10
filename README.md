@@ -210,41 +210,43 @@ robotwin_root: ${data.data_root}/robotwin2.0
 qwen_cache_dir: ${data.robotwin_root}/qwen_cache
 ```
 
-If you only need physical non-idle parquet files for the LeRobot v3 chunk/file layout, without rewriting videos, run:
+To create a standalone LeRobot v3 dataset containing only non-idle frame rows, without duplicating videos or images, run:
 
 ```bash
 python scripts/data/create_lerobot_v3_nonidle_parquets.py \
-  data/robotwin2.0/robotwin2.0
+  data/robotwin2.0/robotwin2.0 \
+  data/robotwin2.0/robotwin2.0_nonidle
 ```
 
-By default this writes the filtered frame rows and matching episode metadata beside the source dataset:
+The output path must not already exist. The command creates a complete dataset layout:
 
 ```text
-data/robotwin2.0/robotwin2.0/
-├── data_nonidle/
-├── meta_nonidle/
+data/robotwin2.0/robotwin2.0_nonidle/
+├── data/                         # filtered parquet rows
+├── meta/
+│   ├── episodes/                # filtered episode metadata
+│   ├── info.json
+│   ├── stats.json
+│   └── tasks.parquet
+├── videos -> /absolute/path/to/source/videos
+├── images -> /absolute/path/to/source/images  # when present
 └── nonidle_parquet_report.json
 ```
 
-The source `data/` and `meta/` directories are left unchanged. The output data parquet files rebuild the global `index` column from zero, while `frame_index` remains the original per-episode frame index so retained frames can still be traced back to the source episode timeline. The output `meta_nonidle/episodes` files update `length`, `dataset_from_index`, and `dataset_to_index` to match the filtered rows.
+The source dataset is left unchanged. All content other than `data`, `meta/episodes`, `videos`, and `images` is copied. Media directories are reused through absolute symlinks. Output data rebuilds the global `index` column from zero while preserving `frame_index` and `timestamp`; `meta/episodes` updates `length`, `dataset_from_index`, and `dataset_to_index`. `meta/info.json.total_frames` is updated, while `meta/stats.json` remains the source dataset statistics.
 
 Useful options:
 
 ```bash
-# Replace existing data_nonidle/ and meta_nonidle/ outputs.
---overwrite
-
-# Write outputs somewhere else.
---data-output-dir /path/to/data_nonidle
---meta-output-dir /path/to/meta_nonidle
---report-path /path/to/nonidle_parquet_report.json
-
 # Tune idle detection thresholds.
 --idle-l2-threshold 1e-3
 --idle-arm-l2-threshold 1e-3
 --idle-gripper-l2-threshold 1e-3
 --min-idle-len 5
 --min-non-idle-len 1
+
+# Print progress every N episodes (0 disables progress output).
+--progress-every 100
 ```
 
 ## Benchmark Environments

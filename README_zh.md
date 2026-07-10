@@ -209,41 +209,43 @@ robotwin_root: ${data.data_root}/robotwin2.0
 qwen_cache_dir: ${data.robotwin_root}/qwen_cache
 ```
 
-如果只需要为 LeRobot v3 chunk/file 布局物理生成 non-idle parquet，而不重写视频，可以运行：
+如果需要生成只包含 non-idle 帧、但不重复存储视频和图片的完整 LeRobot v3 数据集，可以运行：
 
 ```bash
 python scripts/data/create_lerobot_v3_nonidle_parquets.py \
-  data/robotwin2.0/robotwin2.0
+  data/robotwin2.0/robotwin2.0 \
+  data/robotwin2.0/robotwin2.0_nonidle
 ```
 
-默认会在原数据集旁边写出过滤后的帧数据和匹配的 episode metadata：
+目标路径必须不存在。命令会创建完整的数据集目录：
 
 ```text
-data/robotwin2.0/robotwin2.0/
-├── data_nonidle/
-├── meta_nonidle/
+data/robotwin2.0/robotwin2.0_nonidle/
+├── data/                         # 过滤后的 parquet
+├── meta/
+│   ├── episodes/                # 过滤后的 episode metadata
+│   ├── info.json
+│   ├── stats.json
+│   └── tasks.parquet
+├── videos -> /源数据绝对路径/videos
+├── images -> /源数据绝对路径/images  # 源目录存在时创建
 └── nonidle_parquet_report.json
 ```
 
-原始的 `data/` 和 `meta/` 目录不会被修改。输出的 data parquet 会把全局 `index` 从 0 重新连续编号；`frame_index` 保留原 episode 内的帧号，方便回溯到源 episode 时间线。输出的 `meta_nonidle/episodes` 会同步更新 `length`、`dataset_from_index` 和 `dataset_to_index`，使其与过滤后的帧行一致。
+源数据集不会被修改。除 `data`、`meta/episodes`、`videos` 和 `images` 外的内容都会复制；媒体目录通过绝对软链接复用。输出 data 会从 0 重建全局 `index`，同时保留原始 `frame_index` 和 `timestamp`；`meta/episodes` 会更新 `length`、`dataset_from_index` 和 `dataset_to_index`。`meta/info.json.total_frames` 会更新为保留帧数，`meta/stats.json` 仍保留源数据统计。
 
 常用参数：
 
 ```bash
-# 覆盖已有的 data_nonidle/ 和 meta_nonidle/ 输出。
---overwrite
-
-# 自定义输出位置。
---data-output-dir /path/to/data_nonidle
---meta-output-dir /path/to/meta_nonidle
---report-path /path/to/nonidle_parquet_report.json
-
 # 调整 idle 检测阈值。
 --idle-l2-threshold 1e-3
 --idle-arm-l2-threshold 1e-3
 --idle-gripper-l2-threshold 1e-3
 --min-idle-len 5
 --min-non-idle-len 1
+
+# 每处理 N 个 episode 输出一次进度（0 表示关闭）。
+--progress-every 100
 ```
 
 ## Benchmark 环境

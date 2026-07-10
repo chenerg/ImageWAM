@@ -1,21 +1,14 @@
 #!/usr/bin/env python3
-"""Create LeRobot v3 non-idle parquet subsets in-place beside the source data.
+"""Create a standalone filtered LeRobot v3 dataset containing non-idle frames.
 
-The source dataset is not modified. For a dataset root like:
+The source dataset is not modified. The output dataset contains filtered
+``data`` and ``meta/episodes`` parquet files, copies all other metadata, and
+uses symlinks to reuse the source ``videos`` and ``images`` directories.
 
-    data/chunk-000/file-000.parquet
-    meta/episodes/chunk-000/file-000.parquet
-
-this script writes:
-
-    data_nonidle/chunk-000/file-000.parquet
-    meta_nonidle/episodes/chunk-000/file-000.parquet
-
-Each output data parquet is a row subset of the corresponding source parquet,
-with the ``index`` column rebuilt globally from zero. Episode metadata parquet
-files preserve their original row/file partitioning, while ``length``,
-``dataset_from_index``, and ``dataset_to_index`` are recomputed from the
-filtered data rows.
+Output data parquet files rebuild ``index`` globally from zero while preserving
+the source ``frame_index`` and ``timestamp``. Episode metadata preserves its
+original row/file partitioning and updates ``length``, ``dataset_from_index``,
+and ``dataset_to_index`` to match the filtered rows.
 """
 
 from __future__ import annotations
@@ -23,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -329,12 +323,56 @@ def _compute_episode_plans(
     return plans
 
 
-def _prepare_output_dir(path: Path, overwrite: bool) -> None:
-    if not path.exists():
-        return
-    if not overwrite:
-        raise FileExistsError(f"Output directory already exists: {path}. Pass --overwrite to replace it.")
-    shutil.rmtree(path)
+def _validate_dataset_paths(source_dataset_dir: Path, output_dataset_dir: Path) -> None:
+    if not source_dataset_dir.is_dir():
+        raise FileNotFoundError(f"Source dataset directory does not exist: {source_dataset_dir}")
+    if (
+        source_dataset_dir == output_dataset_dir
+        or source_dataset_dir in output_dataset_dir.parents
+        or output_dataset_dir in source_dataset_dir.parents
+    ):
+        raise ValueError(
+            "Source and output dataset directories must not be identical or nested: "
+            f"source={source_dataset_dir}, output={output_dataset_dir}"
+        )
+    if output_dataset_dir.exists() or output_dataset_dir.is_symlink():
+        raise FileExistsError(f"Output dataset path already exists: {output_dataset_dir}")
+
+
+def _copy_dataset_scaffold(source_dataset_dir: Path, staging_dir: Path) -> None:
+    """Copy everything except data/episodes/media into the staging dataset."""
+
+    def ignore(path: str, names: list[str]) -> set[str]:
+        relative_path = Path(path).resolve().relative_to(source_dataset_dir)
+        if relative_path == Path("."):
+            return {name for name in ("data", "videos", "images") if name in names}
+        if relative_path == Path("meta") and "episodes" in names:
+            return {"episodes"}
+        return set()
+
+    shutil.copytree(
+        source_dataset_dir,
+        staging_dir,
+        dirs_exist_ok=True,
+        symlinks=True,
+        ignore=ignore,
+    )
+
+
+def _link_media_directories(source_dataset_dir: Path, staging_dir: Path) -> None:
+    for name in ("videos", "images"):
+        source_path = source_dataset_dir / name
+        if source_path.is_dir():
+            (staging_dir / name).symlink_to(source_path.resolve(), target_is_directory=True)
+
+
+def _update_output_info(staging_dir: Path, kept_frames: int) -> None:
+    info_path = staging_dir / "meta" / "info.json"
+    if not info_path.is_file():
+        raise FileNotFoundError(f"Copied LeRobot info.json not found: {info_path}")
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["total_frames"] = kept_frames
+    info_path.write_text(json.dumps(info, indent=4, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def _relative_data_output_path(dataset_dir: Path, data_path: Path, data_output_dir: Path) -> Path:
@@ -461,85 +499,100 @@ def _write_meta_nonidle(
 
 
 def create_nonidle_parquets(
-    dataset_dir: Path,
+    source_dataset_dir: Path,
+    output_dataset_dir: Path,
     *,
-    data_output_dir: Path | None = None,
-    meta_output_dir: Path | None = None,
     thresholds: IdleThresholds,
-    overwrite: bool = False,
-    report_path: Path | None = None,
     progress_every: int = 100,
 ) -> dict[str, Any]:
-    dataset_dir = dataset_dir.expanduser().resolve()
-    data_output_dir = (data_output_dir or dataset_dir / "data_nonidle").expanduser().resolve()
-    meta_output_dir = (meta_output_dir or dataset_dir / "meta_nonidle").expanduser().resolve()
-    report_path = (report_path or dataset_dir / "nonidle_parquet_report.json").expanduser().resolve()
+    source_dataset_dir = source_dataset_dir.expanduser().resolve()
+    requested_output_path = output_dataset_dir.expanduser().absolute()
+    output_dataset_dir = requested_output_path.resolve()
+    _validate_dataset_paths(source_dataset_dir, output_dataset_dir)
+    if requested_output_path.is_symlink():
+        raise FileExistsError(f"Output dataset path already exists: {requested_output_path}")
 
-    info = _read_info(dataset_dir)
-    specs = _load_episode_specs(dataset_dir)
+    info = _read_info(source_dataset_dir)
+    specs = _load_episode_specs(source_dataset_dir)
     if not specs:
-        raise FileNotFoundError(f"No LeRobot v3 episodes found under {dataset_dir}")
-
-    _prepare_output_dir(data_output_dir, overwrite)
-    _prepare_output_dir(meta_output_dir, overwrite)
+        raise FileNotFoundError(f"No LeRobot v3 episodes found under {source_dataset_dir}")
 
     plans = _compute_episode_plans(
-        dataset_dir,
+        source_dataset_dir,
         info,
         specs,
         thresholds,
         progress_every=progress_every,
     )
-    output_indices_by_episode = _write_data_nonidle(
-        dataset_dir,
-        info,
-        specs,
-        plans,
-        data_output_dir=data_output_dir,
-    )
-    intervals = _episode_intervals_from_output_indices(specs, output_indices_by_episode)
-    _write_meta_nonidle(dataset_dir, specs, intervals, meta_output_dir=meta_output_dir)
 
     total_frames = sum(spec.length for spec in specs)
     kept_frames = sum(plan.kept_frames for plan in plans.values())
-    report = {
-        "format": "imagewam_lerobot_v3_nonidle_parquet_subset_v1",
-        "dataset_dir": str(dataset_dir),
-        "data_output_dir": str(data_output_dir),
-        "meta_output_dir": str(meta_output_dir),
-        "thresholds": {
-            "idle_l2_threshold": thresholds.idle_l2_threshold,
-            "idle_arm_l2_threshold": thresholds.idle_arm_l2_threshold,
-            "idle_gripper_l2_threshold": thresholds.idle_gripper_l2_threshold,
-            "min_idle_len": thresholds.min_idle_len,
-            "min_non_idle_len": thresholds.min_non_idle_len,
-        },
-        "summary": {
-            "episodes": len(specs),
-            "data_files": len({spec.data_file_key for spec in specs}),
-            "total_frames": total_frames,
-            "kept_frames": kept_frames,
-            "removed_frames": total_frames - kept_frames,
-            "kept_rate": kept_frames / max(total_frames, 1),
-        },
-        "episodes": [
-            {
-                "episode_index": spec.episode_index,
-                "source_length": spec.length,
-                "kept_frames": plans[spec.episode_index].kept_frames,
-                "keep_ranges": plans[spec.episode_index].keep_ranges,
-                "dataset_from_index": intervals[spec.episode_index][1],
-                "dataset_to_index": intervals[spec.episode_index][2],
-            }
-            for spec in specs
-        ],
-    }
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    output_dataset_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f".{output_dataset_dir.name}.tmp-",
+            dir=output_dataset_dir.parent,
+        )
+    )
+    try:
+        _copy_dataset_scaffold(source_dataset_dir, staging_dir)
+        _link_media_directories(source_dataset_dir, staging_dir)
+        output_indices_by_episode = _write_data_nonidle(
+            source_dataset_dir,
+            info,
+            specs,
+            plans,
+            data_output_dir=staging_dir / "data",
+        )
+        intervals = _episode_intervals_from_output_indices(specs, output_indices_by_episode)
+        _write_meta_nonidle(
+            source_dataset_dir,
+            specs,
+            intervals,
+            meta_output_dir=staging_dir / "meta",
+        )
+        _update_output_info(staging_dir, kept_frames)
 
-    print(f"Wrote non-idle data parquet files under: {data_output_dir}")
-    print(f"Wrote non-idle episode metadata under: {meta_output_dir}")
-    print(f"Wrote report: {report_path}")
+        report = {
+            "format": "imagewam_lerobot_v3_nonidle_dataset_v2",
+            "source_dataset_dir": str(source_dataset_dir),
+            "output_dataset_dir": str(output_dataset_dir),
+            "thresholds": {
+                "idle_l2_threshold": thresholds.idle_l2_threshold,
+                "idle_arm_l2_threshold": thresholds.idle_arm_l2_threshold,
+                "idle_gripper_l2_threshold": thresholds.idle_gripper_l2_threshold,
+                "min_idle_len": thresholds.min_idle_len,
+                "min_non_idle_len": thresholds.min_non_idle_len,
+            },
+            "summary": {
+                "episodes": len(specs),
+                "data_files": len({spec.data_file_key for spec in specs}),
+                "total_frames": total_frames,
+                "kept_frames": kept_frames,
+                "removed_frames": total_frames - kept_frames,
+                "kept_rate": kept_frames / max(total_frames, 1),
+            },
+            "episodes": [
+                {
+                    "episode_index": spec.episode_index,
+                    "source_length": spec.length,
+                    "kept_frames": plans[spec.episode_index].kept_frames,
+                    "keep_ranges": plans[spec.episode_index].keep_ranges,
+                    "dataset_from_index": intervals[spec.episode_index][1],
+                    "dataset_to_index": intervals[spec.episode_index][2],
+                }
+                for spec in specs
+            ],
+        }
+        report_path = staging_dir / "nonidle_parquet_report.json"
+        report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        staging_dir.replace(output_dataset_dir)
+    except Exception:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+
+    print(f"Wrote standalone non-idle dataset: {output_dataset_dir}")
+    print(f"Wrote report: {output_dataset_dir / 'nonidle_parquet_report.json'}")
     print(
         f"episodes={len(specs)} total_frames={total_frames} kept_frames={kept_frames} "
         f"removed_frames={total_frames - kept_frames} kept_rate={report['summary']['kept_rate'] * 100:.2f}%"
@@ -549,11 +602,8 @@ def create_nonidle_parquets(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("dataset_dir", type=Path)
-    parser.add_argument("--data-output-dir", type=Path, default=None)
-    parser.add_argument("--meta-output-dir", type=Path, default=None)
-    parser.add_argument("--report-path", type=Path, default=None)
-    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("source_dataset_dir", type=Path)
+    parser.add_argument("output_dataset_dir", type=Path)
     parser.add_argument("--idle-l2-threshold", type=float, default=1e-3)
     parser.add_argument("--idle-arm-l2-threshold", type=float, default=1e-3)
     parser.add_argument("--idle-gripper-l2-threshold", type=float, default=1e-3)
@@ -566,11 +616,8 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     create_nonidle_parquets(
-        args.dataset_dir,
-        data_output_dir=args.data_output_dir,
-        meta_output_dir=args.meta_output_dir,
-        report_path=args.report_path,
-        overwrite=args.overwrite,
+        args.source_dataset_dir,
+        args.output_dataset_dir,
         thresholds=IdleThresholds(
             idle_l2_threshold=args.idle_l2_threshold,
             idle_arm_l2_threshold=args.idle_arm_l2_threshold,

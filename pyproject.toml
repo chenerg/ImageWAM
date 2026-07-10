@@ -79,6 +79,10 @@ interndata_pretrain = [
 where = ["src"]
 include = ["imagewam*"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["third_party"]
+
 # ---------------------------------------------------------------------------
 # uv: 把 torch / torchvision / torchcodec 指向 cu118 wheel index
 # 安装命令: uv pip install -e .
