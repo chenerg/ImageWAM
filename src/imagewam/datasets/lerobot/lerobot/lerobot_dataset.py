@@ -879,15 +879,48 @@ class LeRobotDataset(torch.utils.data.Dataset):
         episodes = self.episodes if self.episodes is not None else list(range(self.meta.total_episodes))
         fpaths = [str(self.meta.get_data_file_path(ep_idx)) for ep_idx in episodes]
         if len(self.meta.video_keys) > 0:
-            video_files = [
-                str(self.meta.get_video_file_path(ep_idx, vid_key))
-                for vid_key in self.meta.video_keys
-                for ep_idx in episodes
-            ]
+            video_files = [str(path) for path in self._get_video_file_paths(episodes)]
             fpaths += video_files
         # episodes are stored in the same files, so we return unique paths only
         fpaths = list(set(fpaths))
         return fpaths
+
+    def _get_video_file_paths(self, episodes: list[int] | set[int]) -> set[Path]:
+        """Return unique video paths using one batched metadata read."""
+        episode_indices = sorted(set(episodes))
+        video_keys = self.meta.video_keys
+        if not episode_indices or not video_keys:
+            return set()
+
+        columns = [
+            column
+            for video_key in video_keys
+            for column in (
+                f"videos/{video_key}/chunk_index",
+                f"videos/{video_key}/file_index",
+            )
+        ]
+        episode_metadata = (
+            self.meta.episodes.select(episode_indices)
+            .select_columns(columns)
+            .with_format(None)[:]
+        )
+
+        return {
+            Path(
+                self.meta.video_path.format(
+                    video_key=video_key,
+                    chunk_index=chunk_index,
+                    file_index=file_index,
+                )
+            )
+            for video_key in video_keys
+            for chunk_index, file_index in zip(
+                episode_metadata[f"videos/{video_key}/chunk_index"],
+                episode_metadata[f"videos/{video_key}/file_index"],
+                strict=True,
+            )
+        }
 
     def load_hf_dataset(self) -> datasets.Dataset:
         """hf_dataset contains all the observations, states, actions, rewards, etc."""
@@ -921,9 +954,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # the filesystem so each physical file is checked at most once.
         if len(self.meta.video_keys) > 0:
             required_video_paths = {
-                self.root / self.meta.get_video_file_path(ep_idx, vid_key)
-                for ep_idx in requested_episodes
-                for vid_key in self.meta.video_keys
+                self.root / path for path in self._get_video_file_paths(requested_episodes)
             }
             if not all(video_path.exists() for video_path in required_video_paths):
                 return False
