@@ -759,10 +759,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # Build a mapping: absolute_index -> relative_index_in_filtered_dataset
         self._absolute_to_relative_idx = None
         if self.episodes is not None:
-            self._absolute_to_relative_idx = {
-                abs_idx.item() if isinstance(abs_idx, torch.Tensor) else abs_idx: rel_idx
-                for rel_idx, abs_idx in enumerate(self.hf_dataset["index"])
-            }
+            self._absolute_to_relative_idx = self._build_absolute_to_relative_idx()
 
         # Setup delta_indices
         if self.delta_timestamps is not None:
@@ -920,15 +917,26 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if not requested_episodes.issubset(available_episodes):
             return False
 
-        # Check if all required video files exist
+        # Episodes can share a chunked video file. Deduplicate paths before hitting
+        # the filesystem so each physical file is checked at most once.
         if len(self.meta.video_keys) > 0:
-            for ep_idx in requested_episodes:
-                for vid_key in self.meta.video_keys:
-                    video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
-                    if not video_path.exists():
-                        return False
+            required_video_paths = {
+                self.root / self.meta.get_video_file_path(ep_idx, vid_key)
+                for ep_idx in requested_episodes
+                for vid_key in self.meta.video_keys
+            }
+            if not all(video_path.exists() for video_path in required_video_paths):
+                return False
 
         return True
+
+    def _build_absolute_to_relative_idx(self) -> dict[int, int]:
+        """Build the filtered-dataset index mapping without running the torch transform."""
+        # `self.hf_dataset["index"]` goes through `hf_transform_to_torch`, which is
+        # needlessly expensive for a full column. `with_format(None)` returns a
+        # shallow dataset copy backed by the same Arrow data and exposes plain ints.
+        absolute_indices = self.hf_dataset.with_format(None)["index"]
+        return dict(zip(absolute_indices, range(len(absolute_indices)), strict=True))
 
     def create_hf_dataset(self) -> datasets.Dataset:
         features = get_hf_features_from_features(self.features)
