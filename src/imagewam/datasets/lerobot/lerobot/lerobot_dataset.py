@@ -1032,11 +1032,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
     ) -> dict[str, list[float]]:
         query_timestamps = {}
         for key in self.meta.video_keys:
-            if query_indices is not None and key in query_indices:
+            if query_indices is None:
+                query_timestamps[key] = [current_ts]
+            elif key in query_indices:
                 timestamps = self.hf_dataset[query_indices[key]]["timestamp"]
                 query_timestamps[key] = torch.stack(timestamps).tolist()
-            else:
-                query_timestamps[key] = [current_ts]
 
         return query_timestamps
 
@@ -1130,7 +1130,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if self.image_transforms is not None:
             image_keys = self.meta.camera_keys
             for cam in image_keys:
-                item[cam] = self.image_transforms(item[cam])
+                if cam in item:
+                    item[cam] = self.image_transforms(item[cam])
 
         # Add task as a string
         task_idx = item["task_index"].item()
