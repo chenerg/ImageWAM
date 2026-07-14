@@ -32,8 +32,3 @@ resume: null
 
 model:
   proprio_dim: ${data.train.processor.proprio_output_dim}
-
-wandb:
-  enabled: true
-  project: imagewam
-  name: robotwin_ovis_u1_imagewam

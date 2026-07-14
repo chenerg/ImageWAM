@@ -25,8 +25,3 @@ resume: null
 
 model:
   proprio_dim: ${data.train.processor.proprio_output_dim}
-
-wandb:
-  enabled: true
-  project: imagewam
-  name: libero_dim_imagewam
